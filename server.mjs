@@ -456,7 +456,7 @@ app.get('/task/new', requireAuth, (req, res) => {
     <option value="exam">自动答题(课后练习,自动积累题库,错题自动重考)</option>
     <option value="combined">刷学时+自动答题(先刷完所有课程,再自动答题)</option>
   </select>
-  <label>并发数(刷学时/组合模式,管理员批准时可修改)</label><input type="number" name="tabs" value="${DEFAULT_TABS}" min="1" max="36" required>
+  <label>并发数(刷学时/组合模式)</label><input type="number" name="tabs" value="${DEFAULT_TABS}" min="1" max="36" required>
   <label>备注(选填)</label><textarea name="note" rows="2"></textarea>
   <button>提交</button> <a href="/dashboard" class="btn gray">返回</a>
   </form></div>`;
