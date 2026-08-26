@@ -11,7 +11,7 @@ pkill -f 'cloudflared tunnel run gaoxiao' 2>/dev/null && echo "已停止旧隧�
 sleep 1
 
 export GX_ADMIN_IDS="${GX_ADMIN_IDS:-XXXXXXXX}"
-# 本机 3000-3001 被 snowluma 容器占用,网站监听 3002(与隧道配置一致)
+# 若默认 3000 端口被占用可改监听端口(示例 3002),需与隧道配置保持一致
 PORT=3002 nohup node server.mjs > server.log 2>&1 &
 echo $! > server.pid
 nohup cloudflared tunnel run gaoxiao > tunnel.log 2>&1 &
