@@ -1,0 +1,12 @@
+# 依赖
+node_modules/
+
+# macOS
+.DS_Store
+
+# 运行时数据(绝不提交:数据库、加密密钥、日志、PID)
+app.db
+secret.key
+*.log
+*.pid
+run.log

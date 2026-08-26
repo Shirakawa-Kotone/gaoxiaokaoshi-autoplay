@@ -1,0 +1,14 @@
+{
+  "name": "gaoxiaokaoshi-autoplay",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "学时助手:逐门课程真实播放至学时达标,不伪造任何服务端记录",
+  "scripts": {
+    "start": "node autoplay.mjs"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "playwright": "^1.62.1"
+  }
+}
