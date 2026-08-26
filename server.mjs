@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { runStudyTask, scanBankTask, runExamTask } from './engine.mjs';
+import { runStudyTask, scanBankTask, runExamTask, runCoursePracticeTask } from './engine.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_FILE = path.join(__dirname, 'app.db');
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 const now = () => new Date().toISOString();
 
 // ---------- 题库 ----------
-const KIND_LABEL = { study: '刷课', exam: '自动答题', bank: '采集题库' };
+const KIND_LABEL = { study: '刷课', exam: '自动答题', bank: '采集题库', practice: '课后练习' };
 const BANK_FILE = path.join(__dirname, 'bank.json');
 
 function bankCount() {
@@ -237,6 +237,14 @@ async function runTaskAsync(taskId) {
       });
       result = r;
       appendTaskLog(taskId, `答题完成: ${r.total} 题 / 命中 ${r.hit} / 填写 ${r.filled} / 新收录 ${r.collected} / 交卷 ${r.submitted ? '是' : '否'}  (题库共 ${bankCount()} 题)`);
+    } else if (t.kind === 'practice') {
+      const r = await runCoursePracticeTask({
+        ...common,
+        bank: loadBank(),
+        onNewBank: (list) => upsertBank(list, 'practice'),
+      });
+      result = r;
+      appendTaskLog(taskId, `课后练习: 完成 ${r.done}/${r.total} 讲, 失败 ${r.failed}; 累计题目 ${r.questions}, 填写 ${r.filled}  (题库共 ${bankCount()} 题)`);
     } else {
       result = await runStudyTask({
         ...common,
@@ -451,6 +459,7 @@ app.get('/task/new', requireAuth, (req, res) => {
     <option value="study">刷课(学习时长)</option>
     <option value="exam">自动答题(进考试→查题库→交卷→收录新题)</option>
     <option value="bank">采集题库(从题库练习页抓题和答案)</option>
+    <option value="practice">课后练习(自动参加每一讲的课后练习并交卷)</option>
   </select>
   <label>考试关键字(仅自动答题,选填;留空自动选第一场可参加的考试)</label><input name="exam_filter" placeholder="如: 毛概 / 期末">
   <label>并发数(仅刷课)</label><input type="number" name="tabs" value="${DEFAULT_TABS}" min="1" max="36" required>
@@ -462,7 +471,7 @@ app.get('/task/new', requireAuth, (req, res) => {
 app.post('/task/new', requireAuth, (req, res) => {
   const examPass = String(req.body.exam_pass || '');
   if (!examPass) return res.redirect('/task/new');
-  const kind = ['study', 'exam', 'bank'].includes(req.body.kind) ? req.body.kind : 'study';
+  const kind = ['study', 'exam', 'bank', 'practice'].includes(req.body.kind) ? req.body.kind : 'study';
   const tabs = Math.min(36, Math.max(1, parseInt(req.body.tabs, 10) || 1));
   db.prepare(`INSERT INTO tasks (user_id, exam_user, exam_pass_enc, kind, tabs, exam_filter, note, status, created_at, updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?)`)

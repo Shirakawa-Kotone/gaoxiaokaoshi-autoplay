@@ -34,25 +34,36 @@ async function launchBrowser() {
   });
 }
 
-/** 登录考试平台,返回已就绪的页面。失败抛错。 */
+/** 登录考试平台,返回已就绪的页面。失败抛错。带重试(站点登录偶发失败)。 */
 async function login(context, { examUser, examPass, log = () => {}, base = BASE }) {
   const loginPage = await context.newPage();
-  log('登录中...');
-  await loginPage.goto(base + '/Default.aspx', { waitUntil: 'domcontentloaded' });
-  try { await loginPage.waitForURL(/Login\.aspx/, { timeout: 15000 }); } catch {}
-  await loginPage.fill('#name', examUser);
-  await loginPage.fill('#pw', examPass);
-  // 直接调用页面登录函数提交表单(headless 下 click 可能不触发导航)
-  await loginPage
-    .evaluate(() => {
-      try { CkeckNotNull(); } catch (e) { document.getElementById('frmLogin').submit(); }
-    })
-    .catch(() => {});
-  await loginPage.waitForTimeout(3000);
-  const clerk = (await context.cookies()).find((c) => c.name === 'Clerk');
-  if (!clerk) throw new Error('登录失败:未获得 Clerk cookie(考试平台账号或密码错误?)');
-  log('登录成功');
-  return loginPage;
+  let lastErr = '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) {
+      log(`登录重试(${attempt}/3)...`);
+      await loginPage.waitForTimeout(2000);
+    }
+    try {
+      await loginPage.goto(base + '/Default.aspx', { waitUntil: 'domcontentloaded' });
+      try { await loginPage.waitForURL(/Login\.aspx/, { timeout: 15000 }); } catch {}
+      await loginPage.waitForTimeout(1200);
+      await loginPage.fill('#name', examUser);
+      await loginPage.fill('#pw', examPass);
+      // 直接调用页面登录函数提交表单(headless 下 click 可能不触发导航)
+      await loginPage
+        .evaluate(() => {
+          try { CkeckNotNull(); } catch (e) { document.getElementById('frmLogin').submit(); }
+        })
+        .catch(() => {});
+      await loginPage.waitForTimeout(3000);
+      const clerk = (await context.cookies()).find((c) => c.name === 'Clerk');
+      if (clerk) { log('登录成功'); return loginPage; }
+      lastErr = '未获得 Clerk cookie';
+    } catch (e) {
+      lastErr = String(e.message || e).split('\n')[0];
+    }
+  }
+  throw new Error('登录失败:' + lastErr + '(考试平台账号或密码错误?)');
 }
 
 /** 页面内 fetch 直发(自带会话 Cookie),返回响应文本 */
@@ -173,6 +184,8 @@ export async function runStudyTask(opts = {}) {
           const a = tr.querySelector('a[onclick*="showframe"]');
           if (!a) continue;
           const m = (a.getAttribute('onclick') || '').match(/showframe\([^,]*,\s*(\d+)\)/);
+          const e = tr.querySelector('a[onclick*="showExam"]');
+          const em = e ? (e.getAttribute('onclick') || '').match(/showExam\((\d+)\)/) : null;
           const tds = tr.querySelectorAll('td');
           const num = (s) => parseInt(String(s || '').replace(/[^0-9]/g, '')) || 0;
           rows.push({
@@ -181,6 +194,8 @@ export async function runStudyTask(opts = {}) {
             reqMin: num(tds[2]?.textContent),
             doneMin: num(tds[3]?.textContent),
             id: m ? m[1] : null,
+            examId: em ? em[1] : null,
+            status: (tds[4]?.textContent || '').trim(),
           });
         }
         const g = (name) => {
@@ -782,6 +797,316 @@ export async function runExamTask(opts = {}) {
 
     log(`=== 答题完成: 共 ${total} 题, 命中 ${hit}, 填写 ${filled}, 新收录 ${collected}, 已交卷 ${submitted ? '是' : '否'} ===`);
     return { exam: target.name, total, hit, filled, collected, submitted };
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+// ============================================================================
+// 任务四:课后练习 —— 遍历每讲课程,自动参加练习并答题交卷
+// ============================================================================
+
+/**
+ * @param {object} opts
+ * @param {string} opts.examUser / opts.examPass  考试平台账号/密码
+ * @param {Object} [opts.bank={}] 题库 {题干: [答案文本...]}
+ * @param {string} [opts.planFilter=''] 只处理指定学习计划(id),空则全部
+ * @param {string} [opts.courseFilter=''] 课程名关键字,空则全部
+ * @param {number} [opts.maxCourses=0] 最多处理几门(0=不限)
+ * @param {(line:string)=>void} [opts.onLog] 日志回调
+ * @param {(p:{course:string,phase:string,msg:string})=>void} [opts.onProgress] 进度回调
+ * @param {(newQuestions:Array<{q:string,answers:string[]}>)=>void} [opts.onNewBank] 收录的新题回调
+ * @returns {Promise<{total:number,done:number,failed:number,questions:number,hit:number,filled:number,collected:number}>}
+ */
+export async function runCoursePracticeTask(opts = {}) {
+  const { examUser, examPass, bank = {}, planFilter = '', courseFilter = '', maxCourses = 0, onLog = () => {}, onProgress = () => {}, onNewBank = () => {} } = opts;
+  const log = (...args) => onLog(args.join(' '));
+  const base = resolveBase(opts);
+  if (!examUser || !examPass) throw new Error('缺少考试平台账号/密码');
+
+  const browser = await launchBrowser();
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    context.on('page', (p) => p.on('dialog', (d) => d.accept().catch(() => {})));
+    const page = await login(context, { examUser, examPass, log, base });
+
+    // ---------- 抓课程列表(全部页,含练习 ID) ----------
+    async function listCourses() {
+      const out = [];
+      let html = await fetchHtml(page, '/Study/LibraryStudyList.aspx');
+      let state = await page.evaluate((html) => {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const rows = [];
+        for (const tr of doc.querySelectorAll('table.table tr')) {
+          const a = tr.querySelector('a[onclick*="showframe"]');
+          if (!a) continue;
+          const m = (a.getAttribute('onclick') || '').match(/showframe\([^,]*,\s*(\d+)\)/);
+          const e = tr.querySelector('a[onclick*="showExam"]');
+          const em = e ? (e.getAttribute('onclick') || '').match(/showExam\((\d+)\)/) : null;
+          const tds = tr.querySelectorAll('td');
+          rows.push({
+            name: (tds[0]?.textContent || '').trim(),
+            planId: (() => { const o = doc.getElementById('ddlClass'); return o ? o.value : ''; })(),
+            id: m ? m[1] : null,
+            examId: em ? em[1] : null,
+          });
+        }
+        const nextBtn = doc.getElementById('PageSplit1_BtnNext');
+        const g = (id) => { const el = doc.getElementById(id); return el ? el.value : ''; };
+        return {
+          rows,
+          hasNext: !!nextBtn && !nextBtn.hasAttribute('disabled'),
+          plans: [...doc.querySelectorAll('#ddlClass option')].map((o) => ({ id: o.value, name: o.textContent.trim() })),
+          vs: g('__VIEWSTATE'), vsg: g('__VIEWSTATEGENERATOR'), ev: g('__EVENTVALIDATION'),
+          isLoginPage: !doc.getElementById('ddlClass'),
+        };
+      }, html);
+      if (state.isLoginPage) throw new Error('会话失效:课程列表返回登录页');
+
+      for (const plan of state.plans) {
+        if (planFilter && String(plan.id) !== String(planFilter)) continue;
+        let form = {
+          __EVENTTARGET: '', __EVENTARGUMENT: '', __LASTFOCUS: '',
+          __VIEWSTATE: state.vs, __VIEWSTATEGENERATOR: state.vsg, __EVENTVALIDATION: state.ev,
+          ddlClass: plan.id, txtName: '', btnSearch: '搜 索',
+        };
+        html = await fetchHtml(page, '/Study/LibraryStudyList.aspx', form);
+        state = await page.evaluate((html) => {
+          const doc = new DOMParser().parseFromString(html, 'text/html');
+          const rows = [];
+          for (const tr of doc.querySelectorAll('table.table tr')) {
+            const a = tr.querySelector('a[onclick*="showframe"]');
+            if (!a) continue;
+            const m = (a.getAttribute('onclick') || '').match(/showframe\([^,]*,\s*(\d+)\)/);
+            const e = tr.querySelector('a[onclick*="showExam"]');
+            const em = e ? (e.getAttribute('onclick') || '').match(/showExam\((\d+)\)/) : null;
+            const tds = tr.querySelectorAll('td');
+            rows.push({
+              name: (tds[0]?.textContent || '').trim(),
+              planId: (() => { const o = doc.getElementById('ddlClass'); return o ? o.value : ''; })(),
+              id: m ? m[1] : null,
+              examId: em ? em[1] : null,
+            });
+          }
+          const nextBtn = doc.getElementById('PageSplit1_BtnNext');
+          const g = (id) => { const el = doc.getElementById(id); return el ? el.value : ''; };
+          return {
+            rows,
+            hasNext: !!nextBtn && !nextBtn.hasAttribute('disabled'),
+            vs: g('__VIEWSTATE'), vsg: g('__VIEWSTATEGENERATOR'), ev: g('__EVENTVALIDATION'),
+            isLoginPage: !doc.getElementById('ddlClass'),
+          };
+        }, html);
+        let guard = 0;
+        while (guard++ < 50) {
+          for (const r of state.rows) {
+            if (r.examId && !out.some((x) => x.name === r.name)) out.push(r);
+          }
+          if (!state.hasNext) break;
+          form = {
+            __EVENTTARGET: 'PageSplit1$BtnNext', __EVENTARGUMENT: '', __LASTFOCUS: '',
+            __VIEWSTATE: state.vs, __VIEWSTATEGENERATOR: state.vsg, __EVENTVALIDATION: state.ev,
+            ddlClass: plan.id, txtName: '',
+          };
+          html = await fetchHtml(page, '/Study/LibraryStudyList.aspx', form);
+          state = await page.evaluate((html) => {
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const rows = [];
+            for (const tr of doc.querySelectorAll('table.table tr')) {
+              const a = tr.querySelector('a[onclick*="showframe"]');
+              if (!a) continue;
+              const m = (a.getAttribute('onclick') || '').match(/showframe\([^,]*,\s*(\d+)\)/);
+              const e = tr.querySelector('a[onclick*="showExam"]');
+              const em = e ? (e.getAttribute('onclick') || '').match(/showExam\((\d+)\)/) : null;
+              const tds = tr.querySelectorAll('td');
+              rows.push({
+                name: (tds[0]?.textContent || '').trim(),
+                planId: (() => { const o = doc.getElementById('ddlClass'); return o ? o.value : ''; })(),
+                id: m ? m[1] : null,
+                examId: em ? em[1] : null,
+              });
+            }
+            const nextBtn = doc.getElementById('PageSplit1_BtnNext');
+            const g = (id) => { const el = doc.getElementById(id); return el ? el.value : ''; };
+            return {
+              rows,
+              hasNext: !!nextBtn && !nextBtn.hasAttribute('disabled'),
+              vs: g('__VIEWSTATE'), vsg: g('__VIEWSTATEGENERATOR'), ev: g('__EVENTVALIDATION'),
+              isLoginPage: !doc.getElementById('ddlClass'),
+            };
+          }, html);
+        }
+      }
+      return out;
+    }
+
+    log('抓取课程列表...');
+    let courses = await listCourses();
+    courses = courses.filter((c) => c.examId && (!courseFilter || c.name.includes(courseFilter)));
+    if (maxCourses > 0) courses = courses.slice(0, maxCourses);
+    if (!courses.length) throw new Error('没有找到带课后练习的课程');
+    log(`共 ${courses.length} 门课带课后练习`);
+
+    // ---------- 单门课后练习 ----------
+    let done = 0, failed = 0, totalQ = 0, hitTotal = 0, filledTotal = 0, collectedTotal = 0;
+
+    for (let ci = 0; ci < courses.length; ci++) {
+      const c = courses[ci];
+      const tag = `[${ci + 1}/${courses.length}] ${c.name}`;
+      try {
+        log(`${tag} 开始课后练习...`);
+        onProgress({ course: c.name, phase: 'start', msg: `开始课后练习 (${ci + 1}/${courses.length})` });
+
+        // 启动练习:chkExam 会 302 到 ExamMain(带 ExamStartId)
+        const examMainUrl = await page.evaluate(async (examId) => {
+          const r = await fetch(`/ExamList/chkExam.aspx?ExamID=${examId}&SiteType=2&IsContinue=0`, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+          const text = await r.text();
+          if (r.url.includes('chkExam')) {
+            // 未跳转:可能是提示页(已参加/未开放)
+            const m = text.match(/alert\([^)]*\)/);
+            return { url: '', msg: (m ? m[0] : text.replace(/\s+/g, ' ').slice(0, 80)) };
+          }
+          return { url: r.url, msg: '' };
+        }, c.examId);
+        if (!examMainUrl.url) {
+          log(`${tag} ⚠ 启动失败: ${examMainUrl.msg}`);
+          failed++;
+          continue;
+        }
+        await page.goto(examMainUrl.url, { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(3500);
+
+        // 找答题 frame(ExamDo / ExamTmStepDo 两种流程)
+        const mainFrame = page.frames().find((f) => /ExamDo\.aspx|ExamTmStepDo\.aspx/.test(f.url()));
+        const headerFrame = page.frames().find((f) => /ExamHeader\.aspx|ExamTmStepHeader\.aspx/.test(f.url()));
+        if (!mainFrame) {
+          log(`${tag} ⚠ 未找到答题 frame,跳过`);
+          failed++;
+          continue;
+        }
+
+        // 逐题(或整页)读题并填答案;ExamTmStepDo 每题一页需点"下一题"导航
+        let hit = 0, filled = 0;
+        const answered = new Set();
+        for (let step = 0; step < 60; step++) {
+          const pageData = await mainFrame
+            .evaluate(() => {
+              const dts = [...document.querySelectorAll('.exam_list dt, .tb_content dt')].filter((d) => d.offsetParent !== null);
+              const nextBtn = document.querySelector('input[value="下一题"]') || document.querySelector('.btn_4');
+              const list = [];
+              for (const dt of dts) {
+                const text = (dt.textContent || '').replace(/\s+/g, ' ').trim();
+                const m = text.match(/\d+[\.、](.*)\(/);
+                if (!m) continue;
+                const q = m[1].replace(/^\s+|\s+$/g, '');
+                const scope = dt.nextElementSibling || dt.parentElement || document;
+                const labels = [...scope.querySelectorAll('label[for^="tm_"]')]
+                  .map((lb) => ({
+                    id: lb.getAttribute('for'),
+                    text: (lb.textContent || '').replace(/^[A-Za-z][、.．]\s*/, '').trim(),
+                  }))
+                  .filter((x) => x.id && x.text);
+                list.push({ q, labels });
+              }
+              return { list, hasNext: !!nextBtn && !nextBtn.disabled };
+            })
+            .catch(() => ({ list: [], hasNext: false }));
+          if (!pageData.list.length) break;
+          for (const item of pageData.list) {
+            if (answered.has(item.q)) continue;
+            answered.add(item.q);
+            const ans = bank[item.q];
+            if (!ans || !ans.length) continue;
+            hit++;
+            for (const a of ans) {
+              for (const lb of item.labels) {
+                const t = lb.text;
+                const match =
+                  t === a ||
+                  ((a === '对' || a === '正确') && /对|正确/.test(t)) ||
+                  ((a === '错' || a === '错误') && /错|错误/.test(t));
+                if (match) {
+                  try { await mainFrame.click(`label[for="${lb.id}"]`, { timeout: 4000 }); filled++; } catch {}
+                  break;
+                }
+              }
+            }
+          }
+          if (!pageData.hasNext) break;
+          await mainFrame
+            .evaluate(() => {
+              const b = document.querySelector('input[value="下一题"]') || document.querySelector('.btn_4');
+              if (b && !b.disabled) b.click();
+            })
+            .catch(() => {});
+          await page.waitForTimeout(1200);
+        }
+        totalQ += answered.size; hitTotal += hit; filledTotal += filled;
+        log(`${tag} 题目 ${answered.size} 命中 ${hit} 填写 ${filled}`);
+
+        // 交卷(顶部框架的 SubmitExam)
+        let submitted = false;
+        if (headerFrame) {
+          submitted = await headerFrame
+            .evaluate(() => {
+              if (typeof window.SubmitExam === 'function') { window.SubmitExam(); return true; }
+              const a = document.querySelector('a[href*="SubmitExam"]');
+              if (a) { a.click(); return true; }
+              return false;
+            })
+            .catch(() => false);
+        }
+        log(`${tag} ${submitted ? '已交卷' : '⚠ 未找到交卷按钮'}`);
+        await page.waitForTimeout(3000);
+
+        // 尝试在答卷/成绩页收录新题
+        let collected = 0;
+        const newQuestions = [];
+        try {
+          const viewData = await page.evaluate(() => {
+            const out = [];
+            const ddtms = [...document.querySelectorAll('div[id^=ddTm_]')];
+            ddtms.forEach((div, i) => {
+              const dt = div.querySelector('dt');
+              if (!dt) return;
+              const text = (dt.textContent || '').trim();
+              const m = text.match(/\d[\.、](.*)\(/);
+              if (!m) return;
+              const q = m[1].replace(/^\s+|\s+$/g, '');
+              const green = [...div.querySelectorAll('.green')].pop();
+              const gt = green ? (green.textContent || '').trim() : '';
+              const answers = [];
+              for (const ch of gt) {
+                if (ch === '对') { answers.push('对'); answers.push('正确'); }
+                else if (ch === '错') { answers.push('错'); answers.push('错误'); }
+                else if (ch >= 'A' && ch <= 'H') {
+                  const idx = ch.charCodeAt(0) - 65;
+                  const lb = document.querySelector(`label[for="tm_${i + 1}_${idx}"]`);
+                  if (lb) answers.push((lb.textContent || '').replace(/^[A-Za-z][、.．]\s*/, '').trim());
+                }
+              }
+              if (answers.length) out.push({ q, answers });
+            });
+            return out;
+          }).catch(() => []);
+          for (const v of viewData) {
+            if (!bank[v.q]) { newQuestions.push(v); collected++; }
+          }
+          if (collected) { onNewBank(newQuestions); collectedTotal += collected; log(`${tag} 收录新题 ${collected} 道`); }
+        } catch {}
+
+        done++;
+        onProgress({ course: c.name, phase: 'done', msg: `完成: 命中${hit} 填写${filled} 收录${collected}` });
+      } catch (e) {
+        const msg = String(e.message || e).split('\n')[0];
+        log(`${tag} ✗ 失败: ${msg}`);
+        failed++;
+      }
+      await page.waitForTimeout(1500);
+    }
+
+    log(`=== 课后练习完毕: 完成 ${done}/${courses.length}, 失败 ${failed}; 累计题目 ${totalQ}, 命中 ${hitTotal}, 填写 ${filledTotal}, 收录 ${collectedTotal} ===`);
+    return { total: courses.length, done, failed, questions: totalQ, hit: hitTotal, filled: filledTotal, collected: collectedTotal };
   } finally {
     await browser.close().catch(() => {});
   }
