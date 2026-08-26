@@ -64,6 +64,9 @@ PORT=3002 HOST=0.0.0.0 GX_ADMIN_IDS=12610000 npm run web
 | `GX_SECRET` | 加密密钥(不设则自动生成 `secret.key`) |
 | `GX_MAX_PARALLEL` | 同时执行的任务数(默认 1) |
 | `GX_DEFAULT_TABS` | 任务默认并发数(默认 4) |
+| `GX_ETA_STUDY` | 刷学时任务预估分钟(默认 60,用于预计结束时间) |
+| `GX_ETA_EXAM` | 自动答题任务预估分钟(默认 30) |
+| `GX_ETA_COMBINED` | 组合任务预估分钟(默认 90) |
 | `GX_QQ` | 页面底部联系 QQ(默认 3651693719) |
 
 ## 其他

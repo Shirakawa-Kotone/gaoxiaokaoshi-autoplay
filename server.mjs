@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   log TEXT NOT NULL DEFAULT '',
   result TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  started_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS bank (
   question TEXT PRIMARY KEY,
@@ -74,6 +75,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at TEXT NOT NULL
 );
 `);
+// 老库补列(started_at:任务实际开始时间,用于 ETA 估算)
+try { db.exec("ALTER TABLE tasks ADD COLUMN started_at TEXT NOT NULL DEFAULT ''"); } catch {}
 
 const now = () => new Date().toISOString();
 
@@ -205,7 +208,7 @@ function appendTaskProgress(taskId, p) {
 async function runTaskAsync(taskId) {
   const t = db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId);
   if (!t) return;
-  db.prepare("UPDATE tasks SET status='running', updated_at=? WHERE id=?").run(now(), taskId);
+  db.prepare("UPDATE tasks SET status='running', started_at=?, updated_at=? WHERE id=?").run(now(), now(), taskId);
   appendTaskLog(taskId, `任务开始执行(${KIND_LABEL[t.kind] || t.kind}${t.kind === 'study' || t.kind === 'combined' ? `, 并发 ${t.tabs}` : ''})`);
   const examPass = decrypt(t.exam_pass_enc);
   if (!examPass) {
@@ -273,6 +276,39 @@ const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').
 const STATUS_LABEL = { pending: '待审批', approved: '排队中', rejected: '已拒绝', running: '执行中', done: '已完成', failed: '失败', cancelled: '已取消' };
 const STATUS_COLOR = { pending: '#b8860b', approved: '#1e6fd9', rejected: '#a00', running: '#1e9e1e', done: '#0a7a0a', failed: '#c00', cancelled: '#888' };
 
+// ---------- ETA 预计结束时间 ----------
+// 每类任务的预估耗时(分钟),可用环境变量覆盖:
+//   GX_ETA_STUDY=60  GX_ETA_EXAM=30  GX_ETA_COMBINED=90
+const ETA_MIN = {
+  study: parseInt(process.env.GX_ETA_STUDY || '60', 10) || 60,
+  exam: parseInt(process.env.GX_ETA_EXAM || '30', 10) || 30,
+  combined: parseInt(process.env.GX_ETA_COMBINED || '90', 10) || 90,
+};
+const fmtHM = (d) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+
+// 单个任务预计剩余分钟(已开始的任务按耗时线性递减,最低 5 分钟)
+function taskRemainMin(t) {
+  const total = ETA_MIN[t.kind] || 60;
+  if (t.status === 'running' && t.started_at) {
+    const elapsed = (Date.now() - new Date(t.started_at).getTime()) / 60000;
+    return Math.max(5, Math.round(total - elapsed));
+  }
+  return total;
+}
+
+// 整条队列(运行中+排队中)按提交先后累加,返回 { taskId: {pos, remainMin, endLabel} }
+function etaMap() {
+  const rows = db.prepare("SELECT * FROM tasks WHERE status IN ('running','approved') ORDER BY created_at ASC").all();
+  const out = {};
+  let ahead = 0;
+  rows.forEach((t, i) => {
+    const rem = taskRemainMin(t);
+    out[t.id] = { pos: i + 1, remainMin: rem, endLabel: fmtHM(new Date(Date.now() + (ahead + rem) * 60000)) };
+    ahead += rem;
+  });
+  return out;
+}
+
 function layout(title, body, user) {
   const nav = user
     ? `<a href="/dashboard">我的任务</a>${user.role === 'admin' ? ' <a href="/admin">管理</a>' : ''} <a href="/logout">退出 ${esc(user.username)}</a>`
@@ -321,6 +357,7 @@ footer{max-width:860px;margin:24px auto 30px;padding:0 12px;color:#888;font-size
 }
 
 function tasksTable(rows, showOwner) {
+  const etas = etaMap();
   const trs = rows.map((t) => {
     let prog = '';
     if (t.kind === 'study') {
@@ -337,14 +374,20 @@ function tasksTable(rows, showOwner) {
         prog = last ? `${esc(last.msg || '')}` : '—';
       } catch {}
     }
+    // ETA 列:运行中/排队中显示预计结束时间
+    let etaCell = '<td class="small muted">—</td>';
+    const eta = etas[t.id];
+    if (t.status === 'running' && eta) etaCell = `<td class="small">≈${eta.endLabel}<br><span class="muted">剩~${eta.remainMin}分</span></td>`;
+    else if (t.status === 'approved' && eta) etaCell = `<td class="small">排队第${eta.pos}位<br>≈${eta.endLabel} 结束</td>`;
     return `<tr><td>#${t.id}</td>${showOwner ? `<td>${esc(t.username)}</td>` : ''}<td>${esc(t.exam_user)}</td>
     <td><span class="badge" style="background:${STATUS_COLOR[t.status]}">${STATUS_LABEL[t.status] || t.status}</span></td>
+    ${etaCell}
     <td class="small">${KIND_LABEL[t.kind] || t.kind}</td>
     <td class="small">${esc(t.note) || '—'}</td><td class="small">${prog}</td>
     <td class="small">${esc(t.created_at.slice(5, 16))}</td>
     <td><a href="/task/${t.id}" class="btn gray" style="padding:4px 10px;width:auto">查看</a></td></tr>`;
   }).join('');
-  return `<div class="table-wrap"><table><tr><th>ID</th>${showOwner ? '<th>学号</th>' : ''}<th>账号</th><th>状态</th><th>类型</th><th>备注</th><th>进度</th><th>时间</th><th></th></tr>${trs}</table></div>`;
+  return `<div class="table-wrap"><table><tr><th>ID</th>${showOwner ? '<th>学号</th>' : ''}<th>账号</th><th>状态</th><th>预计结束</th><th>类型</th><th>备注</th><th>进度</th><th>时间</th><th></th></tr>${trs}</table></div>`;
 }
 
 function progressTable(t) {
@@ -479,8 +522,13 @@ app.get('/task/:id', requireAuth, (req, res) => {
   if (t.user_id !== req.user.id && req.user.role !== 'admin') return res.status(403).send(layout('无权限', '<div class="card"><div class="err">无权限</div></div>', req.user));
   const canApprove = req.user.role === 'admin' && ['pending', 'rejected'].includes(t.status);
   const canCancel = ['pending', 'approved'].includes(t.status) && (t.user_id === req.user.id || req.user.role === 'admin');
+  const eta = etaMap()[t.id];
+  const etaLine = eta
+    ? `<p class="muted" id="etaLine">预计结束: <b>≈${eta.endLabel}</b>${t.status === 'running' ? `(剩余约 ${eta.remainMin} 分钟)` : `(排队第 ${eta.pos} 位,剩余约 ${eta.remainMin} 分钟)`}</p>`
+    : '';
   const body = `<div class="card"><h1>任务 #${t.id} <span class="badge" style="background:${STATUS_COLOR[t.status]}">${STATUS_LABEL[t.status] || t.status}</span> <span class="badge" style="background:#555">${KIND_LABEL[t.kind] || t.kind}</span></h1>
   <p class="muted">账号: ${esc(t.exam_user)}${['study', 'combined'].includes(t.kind) ? ' · 并发: ' + t.tabs : ''}${t.note ? ' · 备注: ' + esc(t.note) : ''}</p>
+  ${etaLine}
   ${canApprove ? `<form method="post" action="/api/tasks/${t.id}/approve" style="display:inline">
     ${['study', 'combined'].includes(t.kind) ? '<label style="display:inline-block;margin:0 6px 0 0">并发数</label><input type="number" name="tabs" value="${t.tabs}" min="1" max="36" style="width:80px;display:inline-block;padding:8px;margin:0 8px 0 0">' : ''}
     <button class="green">批准</button></form>
@@ -494,6 +542,8 @@ app.get('/task/:id', requireAuth, (req, res) => {
       const d = await (await fetch('/api/tasks/${t.id}')).json();
       document.getElementById('progress').innerHTML = d.progressHtml;
       document.getElementById('log').textContent = d.log || '(暂无)';
+      const el = document.getElementById('etaLine');
+      if (el) el.textContent = d.etaLine || '';
     } catch (e) {}
   }, 5000);
   </script>`;
@@ -570,7 +620,11 @@ app.get('/api/tasks/:id', requireAuth, (req, res) => {
   const t = db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id);
   if (!t) return res.status(404).json({ error: 'not found' });
   if (t.user_id !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
-  res.json({ status: t.status, progressHtml: progressTable(t), log: t.log, result: t.result });
+  const eta = etaMap()[t.id];
+  const etaLine = eta
+    ? `预计结束: ≈${eta.endLabel}${t.status === 'running' ? `(剩余约 ${eta.remainMin} 分钟)` : `(排队第 ${eta.pos} 位,剩余约 ${eta.remainMin} 分钟)`}`
+    : '';
+  res.json({ status: t.status, progressHtml: progressTable(t), log: t.log, result: t.result, etaLine });
 });
 
 app.post('/api/tasks/:id/approve', requireAuth, requireAdmin, (req, res) => {
