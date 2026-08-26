@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 const now = () => new Date().toISOString();
 
 // ---------- 题库 ----------
-const KIND_LABEL = { study: '刷课', exam: '自动答题', bank: '采集题库', practice: '课后练习' };
+const KIND_LABEL = { study: '刷学时', exam: '自动答题', combined: '刷学时+自动答题' };
 const BANK_FILE = path.join(__dirname, 'bank.json');
 
 function bankCount() {
@@ -206,7 +206,7 @@ async function runTaskAsync(taskId) {
   const t = db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId);
   if (!t) return;
   db.prepare("UPDATE tasks SET status='running', updated_at=? WHERE id=?").run(now(), taskId);
-  appendTaskLog(taskId, `任务开始执行(${KIND_LABEL[t.kind] || t.kind}${t.kind === 'study' ? `, 并发 ${t.tabs}` : ''})`);
+  appendTaskLog(taskId, `任务开始执行(${KIND_LABEL[t.kind] || t.kind}${t.kind === 'study' || t.kind === 'combined' ? `, 并发 ${t.tabs}` : ''})`);
   const examPass = decrypt(t.exam_pass_enc);
   if (!examPass) {
     db.prepare("UPDATE tasks SET status='failed', result='凭证解密失败', updated_at=? WHERE id=?").run(now(), taskId);
@@ -221,30 +221,26 @@ async function runTaskAsync(taskId) {
   };
   try {
     let result;
-    if (t.kind === 'bank') {
-      const r = await scanBankTask({
-        ...common,
-      });
-      const added = upsertBank(r.questions, 'scan');
-      result = { pages: r.pages, scanned: r.questions.length, added };
-      appendTaskLog(taskId, `采集完成: 解析 ${r.questions.length} 题, 新增入库 ${added} 题, 题库共 ${bankCount()} 题`);
-    } else if (t.kind === 'exam') {
-      const r = await runExamTask({
-        ...common,
-        examFilter: t.exam_filter,
-        bank: loadBank(),
-        onNewBank: (list) => upsertBank(list, 'exam'),
-      });
-      result = r;
-      appendTaskLog(taskId, `答题完成: ${r.total} 题 / 命中 ${r.hit} / 填写 ${r.filled} / 新收录 ${r.collected} / 交卷 ${r.submitted ? '是' : '否'}  (题库共 ${bankCount()} 题)`);
-    } else if (t.kind === 'practice') {
+    if (t.kind === 'exam') {
       const r = await runCoursePracticeTask({
         ...common,
         bank: loadBank(),
-        onNewBank: (list) => upsertBank(list, 'practice'),
+        retryFull: true,
       });
       result = r;
-      appendTaskLog(taskId, `课后练习: 完成 ${r.done}/${r.total} 讲, 失败 ${r.failed}; 累计题目 ${r.questions}, 填写 ${r.filled}  (题库共 ${bankCount()} 题)`);
+      appendTaskLog(taskId, `自动答题(课后练习): 完成 ${r.done}/${r.total} 讲, 失败 ${r.failed}, ${r.rounds} 轮; 累计题目 ${r.questions}, 命中 ${r.hit}, 填写 ${r.filled}  (题库共 ${bankCount()} 题)`);
+    } else if (t.kind === 'combined') {
+      appendTaskLog(taskId, '阶段一: 刷学时...');
+      const s = await runStudyTask({ ...common, tabs: t.tabs });
+      appendTaskLog(taskId, `阶段一完成: ${s.done}/${s.courses} 门`);
+      appendTaskLog(taskId, '阶段二: 自动答题(课后练习)...');
+      const r = await runCoursePracticeTask({
+        ...common,
+        bank: loadBank(),
+        retryFull: true,
+      });
+      result = { study: s, practice: r };
+      appendTaskLog(taskId, `阶段二完成: ${r.done}/${r.total} 讲, 失败 ${r.failed}, ${r.rounds} 轮; 题库共 ${bankCount()} 题`);
     } else {
       result = await runStudyTask({
         ...common,
@@ -456,13 +452,11 @@ app.get('/task/new', requireAuth, (req, res) => {
   <label>密码</label><input type="password" name="exam_pass" required>
   <label>任务类型</label>
   <select name="kind">
-    <option value="study">刷课(学习时长)</option>
-    <option value="exam">自动答题(进考试→查题库→交卷→收录新题)</option>
-    <option value="bank">采集题库(从题库练习页抓题和答案)</option>
-    <option value="practice">课后练习(自动参加每一讲的课后练习并交卷)</option>
+    <option value="study">刷学时(学习时长)</option>
+    <option value="exam">自动答题(课后练习,自动积累题库,错题自动重考)</option>
+    <option value="combined">刷学时+自动答题(先刷完所有课程,再自动答题)</option>
   </select>
-  <label>考试关键字(仅自动答题,选填;留空自动选第一场可参加的考试)</label><input name="exam_filter" placeholder="如: 毛概 / 期末">
-  <label>并发数(仅刷课)</label><input type="number" name="tabs" value="${DEFAULT_TABS}" min="1" max="36" required>
+  <label>并发数(刷学时/组合模式,管理员批准时可修改)</label><input type="number" name="tabs" value="${DEFAULT_TABS}" min="1" max="36" required>
   <label>备注(选填)</label><textarea name="note" rows="2"></textarea>
   <button>提交</button> <a href="/dashboard" class="btn gray">返回</a>
   </form></div>`;
@@ -471,7 +465,7 @@ app.get('/task/new', requireAuth, (req, res) => {
 app.post('/task/new', requireAuth, (req, res) => {
   const examPass = String(req.body.exam_pass || '');
   if (!examPass) return res.redirect('/task/new');
-  const kind = ['study', 'exam', 'bank', 'practice'].includes(req.body.kind) ? req.body.kind : 'study';
+  const kind = ['study', 'exam', 'combined'].includes(req.body.kind) ? req.body.kind : 'study';
   const tabs = Math.min(36, Math.max(1, parseInt(req.body.tabs, 10) || 1));
   db.prepare(`INSERT INTO tasks (user_id, exam_user, exam_pass_enc, kind, tabs, exam_filter, note, status, created_at, updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?)`)
@@ -486,8 +480,10 @@ app.get('/task/:id', requireAuth, (req, res) => {
   const canApprove = req.user.role === 'admin' && ['pending', 'rejected'].includes(t.status);
   const canCancel = ['pending', 'approved'].includes(t.status) && (t.user_id === req.user.id || req.user.role === 'admin');
   const body = `<div class="card"><h1>任务 #${t.id} <span class="badge" style="background:${STATUS_COLOR[t.status]}">${STATUS_LABEL[t.status] || t.status}</span> <span class="badge" style="background:#555">${KIND_LABEL[t.kind] || t.kind}</span></h1>
-  <p class="muted">账号: ${esc(t.exam_user)}${t.kind === 'study' ? ' · 并发: ' + t.tabs : ''}${t.exam_filter ? ' · 考试关键字: ' + esc(t.exam_filter) : ''}${t.note ? ' · 备注: ' + esc(t.note) : ''}</p>
-  ${canApprove ? `<form method="post" action="/api/tasks/${t.id}/approve" style="display:inline"><button class="green">批准</button></form>
+  <p class="muted">账号: ${esc(t.exam_user)}${['study', 'combined'].includes(t.kind) ? ' · 并发: ' + t.tabs : ''}${t.note ? ' · 备注: ' + esc(t.note) : ''}</p>
+  ${canApprove ? `<form method="post" action="/api/tasks/${t.id}/approve" style="display:inline">
+    ${['study', 'combined'].includes(t.kind) ? '<label style="display:inline-block;margin:0 6px 0 0">并发数</label><input type="number" name="tabs" value="${t.tabs}" min="1" max="36" style="width:80px;display:inline-block;padding:8px;margin:0 8px 0 0">' : ''}
+    <button class="green">批准</button></form>
     <form method="post" action="/api/tasks/${t.id}/reject" style="display:inline"><button class="red">拒绝</button></form>` : ''}
   ${canCancel ? `<form method="post" action="/api/tasks/${t.id}/cancel" style="display:inline"><button class="gray">取消</button></form>` : ''}
   <h2>进度</h2><div id="progress">${progressTable(t)}</div>
@@ -580,8 +576,9 @@ app.get('/api/tasks/:id', requireAuth, (req, res) => {
 app.post('/api/tasks/:id/approve', requireAuth, requireAdmin, (req, res) => {
   const t = db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id);
   if (!t || !['pending', 'rejected'].includes(t.status)) return res.redirect('/admin');
-  db.prepare("UPDATE tasks SET status='approved', updated_at=? WHERE id=?").run(now(), t.id);
-  appendTaskLog(t.id, '已批准,进入队列');
+  const tabs = Math.min(36, Math.max(1, parseInt(req.body.tabs, 10) || t.tabs));
+  db.prepare("UPDATE tasks SET status='approved', tabs=?, updated_at=? WHERE id=?").run(tabs, now(), t.id);
+  appendTaskLog(t.id, `已批准,进入队列(并发 ${tabs})`);
   res.redirect(`/task/${t.id}`);
 });
 app.post('/api/tasks/:id/reject', requireAuth, requireAdmin, (req, res) => {

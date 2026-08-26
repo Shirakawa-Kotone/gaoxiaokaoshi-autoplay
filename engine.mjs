@@ -803,8 +803,14 @@ export async function runExamTask(opts = {}) {
 }
 
 // ============================================================================
-// 任务四:课后练习 —— 遍历每讲课程,自动参加练习并答题交卷
+// 任务四:课后练习(自动答题)—— 遍历每讲参加练习并答题交卷,错题自动重考
 // ============================================================================
+
+/** 课程名转成绩页键名:"1.1 国防概述" -> "1.01" */
+function courseToScoreKey(name) {
+  const m = String(name || '').match(/^(\d+)\.(\d+)/);
+  return m ? `${m[1]}.0${m[2]}` : String(name || '');
+}
 
 /**
  * @param {object} opts
@@ -813,13 +819,15 @@ export async function runExamTask(opts = {}) {
  * @param {string} [opts.planFilter=''] 只处理指定学习计划(id),空则全部
  * @param {string} [opts.courseFilter=''] 课程名关键字,空则全部
  * @param {number} [opts.maxCourses=0] 最多处理几门(0=不限)
+ * @param {boolean} [opts.retryFull=true] 错题自动重考(查成绩,未满分重考)
+ * @param {number} [opts.maxRounds=3] 最大轮次
  * @param {(line:string)=>void} [opts.onLog] 日志回调
  * @param {(p:{course:string,phase:string,msg:string})=>void} [opts.onProgress] 进度回调
  * @param {(newQuestions:Array<{q:string,answers:string[]}>)=>void} [opts.onNewBank] 收录的新题回调
- * @returns {Promise<{total:number,done:number,failed:number,questions:number,hit:number,filled:number,collected:number}>}
+ * @returns {Promise<{total:number,done:number,failed:number,rounds:number,questions:number,hit:number,filled:number,collected:number}>}
  */
 export async function runCoursePracticeTask(opts = {}) {
-  const { examUser, examPass, bank = {}, planFilter = '', courseFilter = '', maxCourses = 0, onLog = () => {}, onProgress = () => {}, onNewBank = () => {} } = opts;
+  const { examUser, examPass, bank = {}, planFilter = '', courseFilter = '', maxCourses = 0, retryFull = true, maxRounds = 3, onLog = () => {}, onProgress = () => {}, onNewBank = () => {} } = opts;
   const log = (...args) => onLog(args.join(' '));
   const base = resolveBase(opts);
   if (!examUser || !examPass) throw new Error('缺少考试平台账号/密码');
@@ -940,6 +948,137 @@ export async function runCoursePracticeTask(opts = {}) {
       return out;
     }
 
+    // ---------- 查询课后练习成绩(MyCj 课后练习分类,全量翻页) ----------
+    async function fetchPracticeScores() {
+      const scores = {};
+      await page.goto(base + '/ExamList/MyCj.aspx', { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2000);
+      await page.selectOption('#ddlCertificateId', '1').catch(() => {});
+      await page.click('#btnSearch').catch(() => {});
+      await page.waitForTimeout(2500);
+      for (let guard = 0; guard < 12; guard++) {
+        const rows = await page
+          .evaluate(() => {
+            const out = [];
+            for (const tr of document.querySelectorAll('table tr')) {
+              const tds = [...tr.querySelectorAll('td')];
+              const nm = (tds[0]?.textContent || '').trim();
+              if (tds.length >= 4 && nm && nm !== '考试名称') {
+                const score = parseInt(String(tds[2]?.textContent || '').replace(/[^0-9]/g, ''), 10);
+                out.push({ name: nm.replace(/[（(]新[)）]/g, '').trim(), score: isNaN(score) ? -1 : score });
+              }
+            }
+            return out;
+          })
+          .catch(() => []);
+        for (const r of rows) if (!(r.name in scores)) scores[r.name] = r.score;
+        const hasNext = await page
+          .evaluate(() => {
+            const next = [...document.querySelectorAll('a')].find((a) => (a.textContent || '').trim() === '下一页');
+            if (next && !next.hasAttribute('disabled')) { next.click(); return true; }
+            return false;
+          })
+          .catch(() => false);
+        if (!hasNext) break;
+        await page.waitForTimeout(1200);
+      }
+      return scores;
+    }
+
+    // ---------- 单讲答题并交卷 ----------
+    async function practiceOne(c, tag) {
+      const examMainUrl = await page.evaluate(async (examId) => {
+        const r = await fetch(`/ExamList/chkExam.aspx?ExamID=${examId}&SiteType=2&IsContinue=0`, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+        const text = await r.text();
+        if (r.url.includes('chkExam')) {
+          const m = text.match(/alert\([^)]*\)/);
+          return { url: '', msg: m ? m[0] : text.replace(/\s+/g, ' ').slice(0, 80) };
+        }
+        return { url: r.url, msg: '' };
+      }, c.examId);
+      if (!examMainUrl.url) return { ok: false, answered: 0, hit: 0, filled: 0, reason: '启动失败:' + examMainUrl.msg };
+      await page.goto(examMainUrl.url, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(3500);
+
+      const mainFrame = page.frames().find((f) => /ExamDo\.aspx|ExamTmStepDo\.aspx/.test(f.url()));
+      const headerFrame = page.frames().find((f) => /ExamHeader\.aspx|ExamTmStepHeader\.aspx/.test(f.url()));
+      if (!mainFrame) return { ok: false, answered: 0, hit: 0, filled: 0, reason: '未找到答题 frame' };
+
+      let hit = 0, filled = 0;
+      const answered = new Set();
+      for (let step = 0; step < 60; step++) {
+        const pageData = await mainFrame
+          .evaluate(() => {
+            const dts = [...document.querySelectorAll('.exam_list dt, .tb_content dt')].filter((d) => d.offsetParent !== null);
+            const nextBtn = document.querySelector('input[value="下一题"]') || document.querySelector('.btn_4');
+            const list = [];
+            for (const dt of dts) {
+              const text = (dt.textContent || '').replace(/\s+/g, ' ').trim();
+              const m = text.match(/\d+[\.、](.*)\(/);
+              if (!m) continue;
+              const q = m[1].replace(/^\s+|\s+$/g, '');
+              const scope = dt.nextElementSibling || dt.parentElement || document;
+              const labels = [...scope.querySelectorAll('label[for^="tm_"]')]
+                .map((lb) => ({
+                  id: lb.getAttribute('for'),
+                  text: (lb.textContent || '').replace(/^[A-Za-z][、.．]\s*/, '').trim(),
+                }))
+                .filter((x) => x.id && x.text);
+              list.push({ q, labels });
+            }
+            return { list, hasNext: !!nextBtn && !nextBtn.disabled };
+          })
+          .catch(() => ({ list: [], hasNext: false }));
+        if (!pageData.list.length) break;
+        for (const item of pageData.list) {
+          if (answered.has(item.q)) continue;
+          answered.add(item.q);
+          const ans = bank[item.q];
+          if (!ans || !ans.length) continue;
+          hit++;
+          let clickedOne = false;
+          for (const a of ans) {
+            if (clickedOne) break;
+            for (const lb of item.labels) {
+              const t = lb.text;
+              const match =
+                t === a ||
+                ((a === '对' || a === '正确') && /对|正确/.test(t)) ||
+                ((a === '错' || a === '错误') && /错|错误/.test(t));
+              if (match) {
+                try { await mainFrame.click(`label[for="${lb.id}"]`, { timeout: 4000 }); filled++; } catch {}
+                clickedOne = true;
+                break;
+              }
+            }
+          }
+        }
+        if (!pageData.hasNext) break;
+        await mainFrame
+          .evaluate(() => {
+            const b = document.querySelector('input[value="下一题"]') || document.querySelector('.btn_4');
+            if (b && !b.disabled) b.click();
+          })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+      }
+
+      let submitted = false;
+      if (headerFrame) {
+        submitted = await headerFrame
+          .evaluate(() => {
+            if (typeof window.SubmitExam === 'function') { window.SubmitExam(); return true; }
+            const a = document.querySelector('a[href*="SubmitExam"]');
+            if (a) { a.click(); return true; }
+            return false;
+          })
+          .catch(() => false);
+      }
+      await page.waitForTimeout(3000);
+      return { ok: submitted, answered: answered.size, hit, filled, reason: submitted ? '' : '未找到交卷按钮' };
+    }
+
+    // ---------- 主流程(多轮,错题自动重考) ----------
     log('抓取课程列表...');
     let courses = await listCourses();
     courses = courses.filter((c) => c.examId && (!courseFilter || c.name.includes(courseFilter)));
@@ -947,166 +1086,49 @@ export async function runCoursePracticeTask(opts = {}) {
     if (!courses.length) throw new Error('没有找到带课后练习的课程');
     log(`共 ${courses.length} 门课带课后练习`);
 
-    // ---------- 单门课后练习 ----------
     let done = 0, failed = 0, totalQ = 0, hitTotal = 0, filledTotal = 0, collectedTotal = 0;
+    let round = 0;
+    let targets = courses;
 
-    for (let ci = 0; ci < courses.length; ci++) {
-      const c = courses[ci];
-      const tag = `[${ci + 1}/${courses.length}] ${c.name}`;
-      try {
-        log(`${tag} 开始课后练习...`);
-        onProgress({ course: c.name, phase: 'start', msg: `开始课后练习 (${ci + 1}/${courses.length})` });
-
-        // 启动练习:chkExam 会 302 到 ExamMain(带 ExamStartId)
-        const examMainUrl = await page.evaluate(async (examId) => {
-          const r = await fetch(`/ExamList/chkExam.aspx?ExamID=${examId}&SiteType=2&IsContinue=0`, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
-          const text = await r.text();
-          if (r.url.includes('chkExam')) {
-            // 未跳转:可能是提示页(已参加/未开放)
-            const m = text.match(/alert\([^)]*\)/);
-            return { url: '', msg: (m ? m[0] : text.replace(/\s+/g, ' ').slice(0, 80)) };
-          }
-          return { url: r.url, msg: '' };
-        }, c.examId);
-        if (!examMainUrl.url) {
-          log(`${tag} ⚠ 启动失败: ${examMainUrl.msg}`);
-          failed++;
-          continue;
-        }
-        await page.goto(examMainUrl.url, { waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(3500);
-
-        // 找答题 frame(ExamDo / ExamTmStepDo 两种流程)
-        const mainFrame = page.frames().find((f) => /ExamDo\.aspx|ExamTmStepDo\.aspx/.test(f.url()));
-        const headerFrame = page.frames().find((f) => /ExamHeader\.aspx|ExamTmStepHeader\.aspx/.test(f.url()));
-        if (!mainFrame) {
-          log(`${tag} ⚠ 未找到答题 frame,跳过`);
-          failed++;
-          continue;
-        }
-
-        // 逐题(或整页)读题并填答案;ExamTmStepDo 每题一页需点"下一题"导航
-        let hit = 0, filled = 0;
-        const answered = new Set();
-        for (let step = 0; step < 60; step++) {
-          const pageData = await mainFrame
-            .evaluate(() => {
-              const dts = [...document.querySelectorAll('.exam_list dt, .tb_content dt')].filter((d) => d.offsetParent !== null);
-              const nextBtn = document.querySelector('input[value="下一题"]') || document.querySelector('.btn_4');
-              const list = [];
-              for (const dt of dts) {
-                const text = (dt.textContent || '').replace(/\s+/g, ' ').trim();
-                const m = text.match(/\d+[\.、](.*)\(/);
-                if (!m) continue;
-                const q = m[1].replace(/^\s+|\s+$/g, '');
-                const scope = dt.nextElementSibling || dt.parentElement || document;
-                const labels = [...scope.querySelectorAll('label[for^="tm_"]')]
-                  .map((lb) => ({
-                    id: lb.getAttribute('for'),
-                    text: (lb.textContent || '').replace(/^[A-Za-z][、.．]\s*/, '').trim(),
-                  }))
-                  .filter((x) => x.id && x.text);
-                list.push({ q, labels });
-              }
-              return { list, hasNext: !!nextBtn && !nextBtn.disabled };
-            })
-            .catch(() => ({ list: [], hasNext: false }));
-          if (!pageData.list.length) break;
-          for (const item of pageData.list) {
-            if (answered.has(item.q)) continue;
-            answered.add(item.q);
-            const ans = bank[item.q];
-            if (!ans || !ans.length) continue;
-            hit++;
-            for (const a of ans) {
-              for (const lb of item.labels) {
-                const t = lb.text;
-                const match =
-                  t === a ||
-                  ((a === '对' || a === '正确') && /对|正确/.test(t)) ||
-                  ((a === '错' || a === '错误') && /错|错误/.test(t));
-                if (match) {
-                  try { await mainFrame.click(`label[for="${lb.id}"]`, { timeout: 4000 }); filled++; } catch {}
-                  break;
-                }
-              }
-            }
-          }
-          if (!pageData.hasNext) break;
-          await mainFrame
-            .evaluate(() => {
-              const b = document.querySelector('input[value="下一题"]') || document.querySelector('.btn_4');
-              if (b && !b.disabled) b.click();
-            })
-            .catch(() => {});
-          await page.waitForTimeout(1200);
-        }
-        totalQ += answered.size; hitTotal += hit; filledTotal += filled;
-        log(`${tag} 题目 ${answered.size} 命中 ${hit} 填写 ${filled}`);
-
-        // 交卷(顶部框架的 SubmitExam)
-        let submitted = false;
-        if (headerFrame) {
-          submitted = await headerFrame
-            .evaluate(() => {
-              if (typeof window.SubmitExam === 'function') { window.SubmitExam(); return true; }
-              const a = document.querySelector('a[href*="SubmitExam"]');
-              if (a) { a.click(); return true; }
-              return false;
-            })
-            .catch(() => false);
-        }
-        log(`${tag} ${submitted ? '已交卷' : '⚠ 未找到交卷按钮'}`);
-        await page.waitForTimeout(3000);
-
-        // 尝试在答卷/成绩页收录新题
-        let collected = 0;
-        const newQuestions = [];
+    while (round < maxRounds && targets.length) {
+      round++;
+      log(`=== 第 ${round} 轮: 处理 ${targets.length} 讲 ===`);
+      onProgress({ course: '', phase: 'round', msg: `第 ${round} 轮: ${targets.length} 讲` });
+      for (let ci = 0; ci < targets.length; ci++) {
+        const c = targets[ci];
+        const tag = `[第${round}轮 ${ci + 1}/${targets.length}] ${c.name}`;
+        onProgress({ course: c.name, phase: 'start', msg: `第${round}轮: ${c.name}` });
         try {
-          const viewData = await page.evaluate(() => {
-            const out = [];
-            const ddtms = [...document.querySelectorAll('div[id^=ddTm_]')];
-            ddtms.forEach((div, i) => {
-              const dt = div.querySelector('dt');
-              if (!dt) return;
-              const text = (dt.textContent || '').trim();
-              const m = text.match(/\d[\.、](.*)\(/);
-              if (!m) return;
-              const q = m[1].replace(/^\s+|\s+$/g, '');
-              const green = [...div.querySelectorAll('.green')].pop();
-              const gt = green ? (green.textContent || '').trim() : '';
-              const answers = [];
-              for (const ch of gt) {
-                if (ch === '对') { answers.push('对'); answers.push('正确'); }
-                else if (ch === '错') { answers.push('错'); answers.push('错误'); }
-                else if (ch >= 'A' && ch <= 'H') {
-                  const idx = ch.charCodeAt(0) - 65;
-                  const lb = document.querySelector(`label[for="tm_${i + 1}_${idx}"]`);
-                  if (lb) answers.push((lb.textContent || '').replace(/^[A-Za-z][、.．]\s*/, '').trim());
-                }
-              }
-              if (answers.length) out.push({ q, answers });
-            });
-            return out;
-          }).catch(() => []);
-          for (const v of viewData) {
-            if (!bank[v.q]) { newQuestions.push(v); collected++; }
+          const r = await practiceOne(c, tag);
+          totalQ += r.answered || 0; hitTotal += r.hit || 0; filledTotal += r.filled || 0;
+          log(`${tag} 题目 ${r.answered || 0} 命中 ${r.hit || 0} 填写 ${r.filled || 0} ${r.ok ? '已交卷' : '⚠ ' + r.reason}`);
+          if (r.ok) {
+            done++;
+            onProgress({ course: c.name, phase: 'done', msg: `第${round}轮完成: 命中${r.hit} 填写${r.filled}` });
+          } else {
+            failed++;
+            onProgress({ course: c.name, phase: 'fail', msg: `第${round}轮失败: ${r.reason}` });
           }
-          if (collected) { onNewBank(newQuestions); collectedTotal += collected; log(`${tag} 收录新题 ${collected} 道`); }
-        } catch {}
-
-        done++;
-        onProgress({ course: c.name, phase: 'done', msg: `完成: 命中${hit} 填写${filled} 收录${collected}` });
-      } catch (e) {
-        const msg = String(e.message || e).split('\n')[0];
-        log(`${tag} ✗ 失败: ${msg}`);
-        failed++;
+        } catch (e) {
+          const msg = String(e.message || e).split('\n')[0];
+          log(`${tag} ✗ 失败: ${msg}`);
+          failed++;
+        }
+        await page.waitForTimeout(1500);
       }
-      await page.waitForTimeout(1500);
+      if (!retryFull) break;
+      log('查询课后练习成绩...');
+      const scores = await fetchPracticeScores().catch(() => ({}));
+      const notFull = courses.filter((c) => {
+        const s = scores[courseToScoreKey(c.name)];
+        return s !== undefined && s >= 0 && s < 100;
+      });
+      log(`本轮后未满分: ${notFull.length} 讲${notFull.length ? ' (自动重考)' : ''}`);
+      targets = notFull;
     }
 
     log(`=== 课后练习完毕: 完成 ${done}/${courses.length}, 失败 ${failed}; 累计题目 ${totalQ}, 命中 ${hitTotal}, 填写 ${filledTotal}, 收录 ${collectedTotal} ===`);
-    return { total: courses.length, done, failed, questions: totalQ, hit: hitTotal, filled: filledTotal, collected: collectedTotal };
+    return { total: courses.length, done, failed, rounds: round, questions: totalQ, hit: hitTotal, filled: filledTotal, collected: collectedTotal };
   } finally {
     await browser.close().catch(() => {});
   }
