@@ -2,15 +2,125 @@
  * 学时助手引擎 —— 单账号、多标签页、真实播放至学时达标。
  * 被 CLI(autoplay.mjs)与 Web 服务(server.mjs)复用。
  * 原则不变:不做伪造请求,视频真实播放,服务端记录真实时长。
+ *
+ * 提供三个任务:
+ *   runStudyTask  刷课:逐门课程真实播放至学时达标
+ *   scanBankTask  采集题库:从「题库练习」页自动解析题目与正确答案
+ *   runExamTask   自动答题:进考试页 → 查题库填答案 → 交卷 → 收录新题
  */
 import { chromium } from 'playwright';
 
 const BASE = 'http://www.gaoxiaokaoshi.com';
+const resolveBase = (opts) => String(opts.baseUrl || BASE).replace(/\/+$/, '');
 
 const POLL_MS = 15000;      // 轮询间隔
 const CHECK_EVERY = 5;      // 每 5 次轮询(≈75s)核对一次已完成学时
 const STALL_MS = 45000;     // 计时停滞超过此毫秒数则重载重播
 const EXTRA_MIN = 10;       // 单课超时保护:需求时长 + 10 分钟
+
+// ---------- 公共:浏览器与登录 ----------
+
+async function launchBrowser() {
+  return chromium.launch({
+    headless: true,
+    channel: 'chromium',
+    args: [
+      '--mute-audio',
+      '--autoplay-policy=no-user-gesture-required',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+    ],
+  });
+}
+
+/** 登录考试平台,返回已就绪的页面。失败抛错。 */
+async function login(context, { examUser, examPass, log = () => {}, base = BASE }) {
+  const loginPage = await context.newPage();
+  log('登录中...');
+  await loginPage.goto(base + '/Default.aspx', { waitUntil: 'domcontentloaded' });
+  try { await loginPage.waitForURL(/Login\.aspx/, { timeout: 15000 }); } catch {}
+  await loginPage.fill('#name', examUser);
+  await loginPage.fill('#pw', examPass);
+  // 直接调用页面登录函数提交表单(headless 下 click 可能不触发导航)
+  await loginPage
+    .evaluate(() => {
+      try { CkeckNotNull(); } catch (e) { document.getElementById('frmLogin').submit(); }
+    })
+    .catch(() => {});
+  await loginPage.waitForTimeout(3000);
+  const clerk = (await context.cookies()).find((c) => c.name === 'Clerk');
+  if (!clerk) throw new Error('登录失败:未获得 Clerk cookie(考试平台账号或密码错误?)');
+  log('登录成功');
+  return loginPage;
+}
+
+/** 页面内 fetch 直发(自带会话 Cookie),返回响应文本 */
+async function fetchHtml(page, path, form) {
+  return page.evaluate(
+    ({ path, form }) => {
+      const opts = { method: 'GET', headers: { 'X-Requested-With': 'XMLHttpRequest' } };
+      if (form) {
+        opts.method = 'POST';
+        opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+        opts.body = new URLSearchParams(form).toString();
+      }
+      return fetch(path, opts).then((r) => r.text());
+    },
+    { path, form }
+  );
+}
+
+/** 题库练习页:解析当前页题目(题干 + 选项 + 正确答案) */
+function parsePracticePageJs() {
+  const out = { questions: [], hasNext: false };
+  const dts = document.querySelectorAll('.exam_list dt');
+  for (const dt of dts) {
+    const text = (dt.textContent || '').trim();
+    const m = text.match(/\d+\.?(.*)/);
+    if (!m) continue;
+    const q = m[1].replace(/\s+$/, '').trim();
+    if (!q) continue;
+    const next = dt.nextElementSibling;
+    const choices = next ? [...next.querySelectorAll('div')].map((d) => {
+      const cm = (d.textContent || '').match(/[A-Za-z]、(.*)/);
+      return cm ? cm[1].trim() : (d.textContent || '').trim();
+    }).filter(Boolean) : [];
+    // 正确答案文本通常在题目行的后续兄弟元素里,如 "正确答案:ABC / 对 / 错"
+    let answers = [];
+    const answerEl = dt.parentElement.querySelector('.green') || (dt.nextElementSibling && dt.nextElementSibling.nextElementSibling);
+    if (answerEl) {
+      const at = (answerEl.textContent || '').trim();
+      const am = at.match(/[：:]([A-Za-z对错正确错误]+)/);
+      if (am) {
+        const letters = am[1].toUpperCase();
+        for (const c of letters) {
+          if (c === '对' || c === '正确') { answers.push('对'); answers.push('正确'); }
+          else if (c === '错' || c === '错误') { answers.push('错'); answers.push('错误'); }
+          else {
+            const idx = c.charCodeAt(0) - 65;
+            if (idx >= 0 && idx < choices.length && choices[idx]) answers.push(choices[idx]);
+          }
+        }
+      }
+    }
+    out.questions.push({ q, choices, answers });
+  }
+  const nextBtn = document.querySelector('#PageSplit1_BtnNext');
+  out.hasNext = !!nextBtn && !nextBtn.disabled;
+  return out;
+}
+
+/** 考试页/答卷页:题目容器选择器(helper 与多版脚本通用) */
+function examQuestionSelectors() {
+  return ['.exam_list dt', '.tb_content dt'];
+}
+
+/** 从题目行文本提取题干(与题库 key 同规则;题号支持 "1." 与 "1、" 两种) */
+function extractQuestion(text) {
+  const m = String(text || '').match(/\d+[\.、](.*)\(/);
+  return m ? m[1].replace(/^\s+|\s+$/g, '') : '';
+}
 
 /**
  * 执行一次学习任务
@@ -41,56 +151,19 @@ export async function runStudyTask(opts = {}) {
 
   const TOTAL_SLOTS = Math.max(1, (parseInt(devices, 10) || 1) * (parseInt(tabs, 10) || 1));
   const log = (...args) => onLog(args.join(' '));
+  const base = resolveBase(opts);
 
   if (!examUser || !examPass) throw new Error('缺少考试平台账号/密码');
 
-  const browser = await chromium.launch({
-    headless: true,
-    channel: 'chromium',
-    args: [
-      '--mute-audio',
-      '--autoplay-policy=no-user-gesture-required',
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-    ],
-  });
+  const browser = await launchBrowser();
 
   try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-    const loginPage = await context.newPage();
+    const loginPage = await login(context, { examUser, examPass, log, base });
     const tabPages = [loginPage];
     for (let i = 1; i < TOTAL_SLOTS; i++) tabPages.push(await context.newPage());
 
-    // ---------- 登录 ----------
-    log('登录中...');
-    await loginPage.goto(BASE + '/Default.aspx', { waitUntil: 'domcontentloaded' });
-    try { await loginPage.waitForURL(/Login\.aspx/, { timeout: 15000 }); } catch {}
-    await loginPage.fill('#name', examUser);
-    await loginPage.fill('#pw', examPass);
-    await Promise.all([
-      loginPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
-      loginPage.click('#btnSubmit'),
-    ]);
-    const clerk = (await context.cookies()).find((c) => c.name === 'Clerk');
-    if (!clerk) throw new Error('登录失败:未获得 Clerk cookie(考试平台账号或密码错误?)');
-    log('登录成功');
-
     // ---------- 列表操作(fetch 直发,不依赖页面导航) ----------
-    async function fetchHtml(page, path, form) {
-      return page.evaluate(
-        ({ path, form }) => {
-          const opts = { method: 'GET', headers: { 'X-Requested-With': 'XMLHttpRequest' } };
-          if (form) {
-            opts.method = 'POST';
-            opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
-            opts.body = new URLSearchParams(form).toString();
-          }
-          return fetch(path, opts).then((r) => r.text());
-        },
-        { path, form }
-      );
-    }
 
     async function parseListHtml(page, html) {
       return page.evaluate((html) => {
@@ -203,7 +276,7 @@ export async function runStudyTask(opts = {}) {
       let state = await parseListHtml(pg, html);
       if (state.isLoginPage) {
         log(tag, '  ⚠ 会话失效,重新登录...');
-        await loginPage.goto(BASE + '/Default.aspx', { waitUntil: 'domcontentloaded' });
+        await loginPage.goto(base + '/Default.aspx', { waitUntil: 'domcontentloaded' });
         try { await loginPage.waitForURL(/Login\.aspx/, { timeout: 15000 }); } catch {}
         await loginPage.fill('#name', examUser);
         await loginPage.fill('#pw', examPass);
@@ -292,7 +365,7 @@ export async function runStudyTask(opts = {}) {
       const need = course.reqMin - course.doneMin;
       log(tag, `▶ 开始: ${course.name}  [已完成 ${course.doneMin}/${course.reqMin} 分钟, 还需 ${need} 分钟]`);
       onProgress({ course: course.name, doneMin: course.doneMin, reqMin: course.reqMin, phase: 'start' });
-      const url = `${BASE}/Study/LibraryStudy.aspx?Id=${course.id}&PlanId=${course.planId}`;
+      const url = `${base}/Study/LibraryStudy.aspx?Id=${course.id}&PlanId=${course.planId}`;
       const startAt = Date.now();
       const deadline = startAt + (need + EXTRA_MIN) * 60 * 1000;
       let checkCount = 0;
@@ -397,6 +470,318 @@ export async function runStudyTask(opts = {}) {
     await Promise.all(runners);
     log(`=== 任务处理完毕: 完成 ${doneTotal}/${courses.length} 门 ===`);
     return { courses: courses.length, done: doneTotal, failed: courses.length - doneTotal };
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+// ============================================================================
+// 任务二:采集题库 —— 从「题库练习」页自动解析题目与正确答案
+// ============================================================================
+
+/**
+ * @param {object} opts
+ * @param {string} opts.examUser / opts.examPass  考试平台账号/密码
+ * @param {(line:string)=>void} [opts.onLog] 日志回调
+ * @param {(p:{page:number,got:number,total:number})=>void} [opts.onProgress] 进度回调
+ * @returns {Promise<{questions:Array<{q:string,choices:string[],answers:string[]}>, pages:number}>}
+ */
+export async function scanBankTask(opts = {}) {
+  const { examUser, examPass, onLog = () => {}, onProgress = () => {} } = opts;
+  const log = (...args) => onLog(args.join(' '));
+  const base = resolveBase(opts);
+  if (!examUser || !examPass) throw new Error('缺少考试平台账号/密码');
+
+  const browser = await launchBrowser();
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    const page = await login(context, { examUser, examPass, log, base });
+
+    log('打开题库练习页...');
+    await page.goto(base + '/ExamList/TkTest.aspx', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
+
+    // 可选分类
+    const tklx = await page.$$eval('#ddlTklx option', (os) =>
+      os.map((o) => ({ v: o.value, t: o.textContent.trim() })).filter((o) => o.v && o.v !== '0&0' && o.t !== '请选择题库')
+    );
+    if (!tklx.length) {
+      throw new Error('题库练习页没有可选题库分类(该账号可能未开通题库练习,或需先在学校后台配置)');
+    }
+    log(`题库分类: ${tklx.map((x) => x.t).join(' / ')}`);
+
+    const collected = [];
+    let pages = 0;
+
+    for (const cat of tklx) {
+      log(`开始采集分类「${cat.t}」...`);
+      await page.selectOption('#ddlTklx', cat.v);
+      await page.waitForTimeout(800);
+      // 搜索按钮触发 postback
+      await page.click('#btnSearch').catch(() => {});
+      await page.waitForTimeout(2500);
+
+      // 若页面出现"无数据/请先搜索"等提示则跳过
+      const bodyText = await page.evaluate(() => (document.body ? document.body.innerText : ''));
+      if (/请选择|无数据|没有找到|暂无/.test(bodyText) && !bodyText.includes('正确答案')) {
+        log(`  「${cat.t}」无题目数据,跳过`);
+        continue;
+      }
+
+      let guard = 0;
+      while (guard++ < 300) {
+        const data = await page.evaluate(parsePracticePageJs);
+        if (data.questions.length) {
+          for (const q of data.questions) {
+            if (!collected.some((c) => c.q === q.q)) collected.push({ ...q, cat: cat.t });
+          }
+        }
+        pages++;
+        onProgress({ page: pages, got: data.questions.length, total: collected.length });
+        log(`  第 ${pages} 页: 解析 ${data.questions.length} 题, 累计 ${collected.length} 题`);
+        if (!data.hasNext) break;
+        // 下一页(postback)
+        const html = await fetchHtml(page, '/ExamList/TkTest.aspx', {
+          __EVENTTARGET: 'PageSplit1$BtnNext',
+          __EVENTARGUMENT: '',
+          __VIEWSTATE: await page.evaluate(() => { const e = document.getElementById('__VIEWSTATE'); return e ? e.value : ''; }),
+          __VIEWSTATEGENERATOR: await page.evaluate(() => { const e = document.getElementById('__VIEWSTATEGENERATOR'); return e ? e.value : ''; }),
+          __EVENTVALIDATION: await page.evaluate(() => { const e = document.getElementById('__EVENTVALIDATION'); return e ? e.value : ''; }),
+        });
+        await page.setContent(html);
+        await page.waitForTimeout(1200);
+      }
+      log(`分类「${cat.t}」采集完成`);
+    }
+
+    log(`=== 采集完成: 共 ${collected.length} 题, 翻页 ${pages} 次 ===`);
+    return { questions: collected, pages };
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+// ============================================================================
+// 任务三:自动答题 —— 进考试页 → 查题库填答案 → 交卷 → 收录新题
+// ============================================================================
+
+/**
+ * @param {object} opts
+ * @param {string} opts.examUser / opts.examPass  考试平台账号/密码
+ * @param {string} [opts.examFilter=''] 考试名称关键字,空则取第一场可参加的考试
+ * @param {Object} [opts.bank={}] 题库 {题干: [答案文本...]}
+ * @param {(line:string)=>void} [opts.onLog] 日志回调
+ * @param {(p:{phase:string,msg:string})=>void} [opts.onProgress] 进度回调
+ * @param {(newQuestions:Array<{q:string,answers:string[]}>)=>void} [opts.onNewBank] 答卷页收录的新题回调
+ * @returns {Promise<{exam:string,total:number,hit:number,filled:number,collected:number,submitted:boolean}>}
+ */
+export async function runExamTask(opts = {}) {
+  const { examUser, examPass, examFilter = '', bank = {}, onLog = () => {}, onProgress = () => {}, onNewBank = () => {} } = opts;
+  const log = (...args) => onLog(args.join(' '));
+  const progress = (phase, msg) => onProgress({ phase, msg });
+  const base = resolveBase(opts);
+  if (!examUser || !examPass) throw new Error('缺少考试平台账号/密码');
+
+  const browser = await launchBrowser();
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    context.on('page', (p) => p.on('dialog', (d) => d.accept().catch(() => {})));
+    const page = await login(context, { examUser, examPass, log, base });
+
+    // ---------- 考试列表 ----------
+    progress('list', '打开考试列表...');
+    await page.goto(base + '/ExamList/ExamList.aspx', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
+
+    const exams = await page.evaluate(() => {
+      const rows = [];
+      for (const tr of document.querySelectorAll('table tr')) {
+        const tds = [...tr.querySelectorAll('td')];
+        const texts = tds.map((td) => (td.textContent || '').trim());
+        const joined = texts.join(' ');
+        if (joined.length < 5 || !tds.length) continue;
+        const anchor = tr.querySelector('a');
+        rows.push({
+          name: texts[0] || '',
+          time: texts[1] || '',
+          duration: texts[2] || '',
+          times: texts[3] || '',
+          actionText: texts[texts.length - 1] || '',
+          href: anchor ? anchor.href : '',
+          onclick: anchor ? (anchor.getAttribute('onclick') || '') : '',
+        });
+      }
+      return rows;
+    });
+    // 过滤表头/无操作行
+    const usable = exams.filter(
+      (e) =>
+        e.name &&
+        e.name !== '考试名称' &&
+        !e.time.startsWith('考试起止') &&
+        !/^考试/.test(e.name) &&
+        e.actionText !== '' &&
+        e.actionText !== e.name
+    );
+    if (!usable.length) {
+      throw new Error(`当前没有可参加的考试${exams.length ? `(列表 ${exams.length} 行,可能已考完或不在考试时段)` : '(考试列表为空)'}`);
+    }
+    const target = examFilter
+      ? usable.find((e) => e.name.includes(examFilter)) || usable[0]
+      : usable[0];
+    log(`目标考试: ${target.name}  (时间: ${target.time} 时长: ${target.duration} 次数: ${target.times})`);
+    progress('enter', `进入考试: ${target.name}`);
+
+    // ---------- 进入答题页(可能开新窗口) ----------
+    const popupResult = await Promise.race([
+      context.waitForEvent('page', { timeout: 12000 }).then((p) => p).catch(() => null),
+      new Promise((resolve) => {
+        (async () => {
+          await page
+            .evaluate((name) => {
+              for (const tr of document.querySelectorAll('table tr')) {
+                const tds = [...tr.querySelectorAll('td')];
+                const first = tds[0] ? (tds[0].textContent || '').trim() : '';
+                if (first && (first === name || first.includes(name))) {
+                  const el = tr.querySelector('a, input[type=button], button');
+                  if (el) { el.click(); return true; }
+                }
+              }
+              return false;
+            }, target.name)
+            .catch(() => {});
+          resolve(null);
+        })();
+      }),
+    ]);
+    const examPage = popupResult || page;
+    await examPage.waitForLoadState('domcontentloaded').catch(() => {});
+    await examPage.waitForTimeout(3000);
+
+    // 答题页可能含 iframe(顶部框架),找实际内容 frame
+    async function activeFrame() {
+      for (const f of examPage.frames()) {
+        const has = await f.evaluate(() => !!document.querySelector('.exam_list, .tb_content, #btnSubmitExam, input[value*="交卷"], a[href*="SubmitExam"]')).catch(() => false);
+        if (has) return f;
+      }
+      return examPage.mainFrame();
+    }
+
+    const frame = await activeFrame();
+    log(`答题页就绪 (frame=${frame !== examPage.mainFrame() ? 'iframe' : '主窗口'})`);
+
+    // ---------- 读题并填答案 ----------
+    const qData = await frame.evaluate((selectors) => {
+      const doc = document;
+      let dts = [];
+      for (const sel of selectors) {
+        dts = [...doc.querySelectorAll(sel)];
+        if (dts.length) break;
+      }
+      const list = [];
+      dts.forEach((dt, i) => {
+        const text = (dt.textContent || '').trim();
+        const m = text.match(/\d+[\.、](.*)\(/);
+        const q = m ? m[1].replace(/^\s+|\s+$/g, '') : '';
+        const inputs = [...doc.querySelectorAll(`input[id^="tm_${i + 1}_"]`)];
+        const labels = inputs
+          .map((inp) => {
+            const lb = doc.querySelector(`label[for="${inp.id}"]`);
+            return lb ? { id: inp.id, text: (lb.textContent || '').replace(/^[A-Za-z][、.．]\s*/, '').trim() } : null;
+          })
+          .filter(Boolean);
+        list.push({ q, labels, inputIds: inputs.map((i) => i.id) });
+      });
+      return list;
+    }, examQuestionSelectors());
+
+    const total = qData.length;
+    let hit = 0, filled = 0;
+    log(`共 ${total} 题,开始查题库填写...`);
+    progress('answering', `共 ${total} 题`);
+
+    for (let i = 0; i < qData.length; i++) {
+      const item = qData[i];
+      const q = item.q;
+      if (!q) { log(`第 ${i + 1} 题: 题干解析失败,跳过`); continue; }
+      const ans = bank[q];
+      if (!ans || !ans.length) { log(`第 ${i + 1} 题: 题库未命中`); continue; }
+      hit++;
+      let clicked = false;
+      for (const a of ans) {
+        for (const lb of item.labels) {
+          const t = lb.text;
+          const match =
+            t === a ||
+            ((a === '对' || a === '正确') && /对|正确/.test(t)) ||
+            ((a === '错' || a === '错误') && /错|错误/.test(t));
+          if (match) {
+            try { await frame.click(`label[for="${lb.id}"]`, { timeout: 5000 }); clicked = true; } catch {}
+          }
+        }
+      }
+      if (clicked) filled++;
+      log(`第 ${i + 1} 题: ${hit ? '命中' : '未命中'} (已填 ${filled})`);
+    }
+    progress('filled', `已填写 ${filled}/${total} 题`);
+
+    // ---------- 交卷 ----------
+    const submitted = await frame.evaluate(() => {
+      if (typeof window.SubmitExam === 'function') { window.SubmitExam(); return true; }
+      const a = document.querySelector('a[href*="SubmitExam"]');
+      if (a) { a.click(); return true; }
+      const btn = [...document.querySelectorAll('input,button,a')].find((el) => /交卷|提交/.test((el.value || el.textContent || '').trim()));
+      if (btn) { btn.click(); return true; }
+      return false;
+    }).catch(() => false);
+    log(submitted ? '已触发交卷' : '⚠ 未找到交卷按钮,跳过交卷(可能需手动处理)');
+    await examPage.waitForTimeout(3000);
+
+    // ---------- 答卷页收录新题 ----------
+    let collected = 0;
+    const newQuestions = [];
+    if (submitted) {
+      progress('view', '等待答卷页,收录正确答案...');
+      await examPage.waitForTimeout(2500);
+      const viewData = await examPage.evaluate(() => {
+        const out = [];
+        const ddtms = [...document.querySelectorAll('div[id^=ddTm_]')];
+        ddtms.forEach((div, i) => {
+          const dt = div.querySelector('dt');
+          if (!dt) return;
+          const text = (dt.textContent || '').trim();
+          const m = text.match(/\d[\.、](.*)\(/);
+          if (!m) return;
+          const q = m[1].replace(/^\s+|\s+$/g, '');
+          const green = [...div.querySelectorAll('.green')].pop();
+          const gt = green ? (green.textContent || '').trim() : '';
+          const answers = [];
+          for (const c of gt) {
+            if (c === '对') { answers.push('对'); answers.push('正确'); }
+            else if (c === '错') { answers.push('错'); answers.push('错误'); }
+            else if (c >= 'A' && c <= 'H') {
+              const idx = c.charCodeAt(0) - 65;
+              const lb = document.querySelector(`label[for="tm_${i + 1}_${idx}"]`);
+              if (lb) answers.push((lb.textContent || '').replace(/^[A-Za-z][、.．]\s*/, '').trim());
+            }
+          }
+          if (answers.length) out.push({ q, answers });
+        });
+        return out;
+      }).catch(() => []);
+      for (const v of viewData) {
+        if (!bank[v.q]) { newQuestions.push(v); collected++; }
+      }
+      if (collected) {
+        onNewBank(newQuestions);
+        log(`答卷页收录新题 ${collected} 道`);
+      } else {
+        log('答卷页无新题(可能全部已在题库,或答卷页未就绪)');
+      }
+    }
+
+    log(`=== 答题完成: 共 ${total} 题, 命中 ${hit}, 填写 ${filled}, 新收录 ${collected}, 已交卷 ${submitted ? '是' : '否'} ===`);
+    return { exam: target.name, total, hit, filled, collected, submitted };
   } finally {
     await browser.close().catch(() => {});
   }

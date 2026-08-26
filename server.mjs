@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { runStudyTask } from './engine.mjs';
+import { runStudyTask, scanBankTask, runExamTask } from './engine.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_FILE = path.join(__dirname, 'app.db');
@@ -31,8 +31,8 @@ const MAX_PARALLEL = parseInt(process.env.GX_MAX_PARALLEL || '1', 10) || 1;
 const DEFAULT_TABS = parseInt(process.env.GX_DEFAULT_TABS || '4', 10) || 4;
 const QQ = process.env.GX_QQ || '3651693719'; // 联系 QQ,显示在页面底部
 
-// 学号范围:12610101 - 12613199
-const SID_MIN = 12610101;
+// 学号范围:12610000 - 12613199
+const SID_MIN = 12610000;
 const SID_MAX = 12613199;
 const isValidSid = (s) => /^\d{8}$/.test(s) && Number(s) >= SID_MIN && Number(s) <= SID_MAX;
 
@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   user_id INTEGER NOT NULL,
   exam_user TEXT NOT NULL,
   exam_pass_enc TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'study',
   tabs INTEGER NOT NULL DEFAULT 4,
+  exam_filter TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'pending',
   progress TEXT NOT NULL DEFAULT '[]',
@@ -59,6 +61,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   result TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bank (
+  question TEXT PRIMARY KEY,
+  answers TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'exam',
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY,
@@ -68,6 +76,47 @@ CREATE TABLE IF NOT EXISTS sessions (
 `);
 
 const now = () => new Date().toISOString();
+
+// ---------- 题库 ----------
+const KIND_LABEL = { study: '刷课', exam: '自动答题', bank: '采集题库' };
+const BANK_FILE = path.join(__dirname, 'bank.json');
+
+function bankCount() {
+  const { c } = db.prepare('SELECT COUNT(*) c FROM bank').get();
+  return c;
+}
+function loadBank() {
+  const out = {};
+  for (const r of db.prepare('SELECT question, answers FROM bank').all()) {
+    try { out[r.question] = JSON.parse(r.answers); } catch {}
+  }
+  return out;
+}
+function upsertBank(list, source) {
+  let n = 0;
+  const ins = db.prepare('INSERT OR IGNORE INTO bank (question, answers, source, created_at) VALUES (?,?,?,?)');
+  for (const item of list) {
+    if (!item || !item.q || !Array.isArray(item.answers) || !item.answers.length) continue;
+    const r = ins.run(String(item.q), JSON.stringify(item.answers), source, now());
+    n += r.changes;
+  }
+  return n;
+}
+function exportBankJson() {
+  return JSON.stringify(loadBank(), null, 2);
+}
+function importBankJson(text) {
+  let data;
+  try { data = JSON.parse(text); } catch { return { ok: false, msg: 'JSON 解析失败' }; }
+  const list = [];
+  for (const [q, a] of Object.entries(data || {})) {
+    const arr = Array.isArray(a) ? a.map((x) => String(x).trim()).filter(Boolean) : [String(a).trim()].filter(Boolean);
+    if (q && arr.length) list.push({ q: String(q).trim(), answers: arr });
+  }
+  if (!list.length) return { ok: false, msg: '未解析到有效题目' };
+  const n = upsertBank(list, 'import');
+  return { ok: true, added: n, total: list.length };
+}
 
 // ---------- 凭证加密(AES-256-GCM) ----------
 function loadSecret() {
@@ -157,23 +206,45 @@ async function runTaskAsync(taskId) {
   const t = db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId);
   if (!t) return;
   db.prepare("UPDATE tasks SET status='running', updated_at=? WHERE id=?").run(now(), taskId);
-  appendTaskLog(taskId, `任务开始执行(并发 ${t.tabs})`);
+  appendTaskLog(taskId, `任务开始执行(${KIND_LABEL[t.kind] || t.kind}${t.kind === 'study' ? `, 并发 ${t.tabs}` : ''})`);
   const examPass = decrypt(t.exam_pass_enc);
   if (!examPass) {
     db.prepare("UPDATE tasks SET status='failed', result='凭证解密失败', updated_at=? WHERE id=?").run(now(), taskId);
     appendTaskLog(taskId, '任务失败: 凭证解密失败');
     return;
   }
+  const common = {
+    examUser: t.exam_user,
+    examPass,
+    onLog: (line) => appendTaskLog(taskId, line),
+    onProgress: (p) => appendTaskProgress(taskId, p),
+  };
   try {
-    const result = await runStudyTask({
-      examUser: t.exam_user,
-      examPass,
-      tabs: t.tabs,
-      onLog: (line) => appendTaskLog(taskId, line),
-      onProgress: (p) => appendTaskProgress(taskId, p),
-    });
+    let result;
+    if (t.kind === 'bank') {
+      const r = await scanBankTask({
+        ...common,
+      });
+      const added = upsertBank(r.questions, 'scan');
+      result = { pages: r.pages, scanned: r.questions.length, added };
+      appendTaskLog(taskId, `采集完成: 解析 ${r.questions.length} 题, 新增入库 ${added} 题, 题库共 ${bankCount()} 题`);
+    } else if (t.kind === 'exam') {
+      const r = await runExamTask({
+        ...common,
+        examFilter: t.exam_filter,
+        bank: loadBank(),
+        onNewBank: (list) => upsertBank(list, 'exam'),
+      });
+      result = r;
+      appendTaskLog(taskId, `答题完成: ${r.total} 题 / 命中 ${r.hit} / 填写 ${r.filled} / 新收录 ${r.collected} / 交卷 ${r.submitted ? '是' : '否'}  (题库共 ${bankCount()} 题)`);
+    } else {
+      result = await runStudyTask({
+        ...common,
+        tabs: t.tabs,
+      });
+      appendTaskLog(taskId, `任务完成: ${result.done}/${result.courses} 门完成`);
+    }
     db.prepare("UPDATE tasks SET status='done', result=?, updated_at=? WHERE id=?").run(JSON.stringify(result), now(), taskId);
-    appendTaskLog(taskId, `任务完成: ${result.done}/${result.courses} 门完成`);
   } catch (e) {
     const msg = String(e.message || e).slice(0, 800);
     db.prepare("UPDATE tasks SET status='failed', result=?, updated_at=? WHERE id=?").run(msg, now(), taskId);
@@ -248,25 +319,38 @@ footer{max-width:860px;margin:24px auto 30px;padding:0 12px;color:#888;font-size
 function tasksTable(rows, showOwner) {
   const trs = rows.map((t) => {
     let prog = '';
-    try {
-      const arr = JSON.parse(t.progress);
-      const done = arr.filter((p) => p.phase === 'done').length;
-      const last = arr[arr.length - 1];
-      prog = done ? `${done} 门完成` : last ? `${esc(last.course)} ${last.doneMin}/${last.reqMin}分` : '—';
-    } catch {}
+    if (t.kind === 'study') {
+      try {
+        const arr = JSON.parse(t.progress);
+        const done = arr.filter((p) => p.phase === 'done').length;
+        const last = arr[arr.length - 1];
+        prog = done ? `${done} 门完成` : last ? `${esc(last.course)} ${last.doneMin}/${last.reqMin}分` : '—';
+      } catch {}
+    } else {
+      try {
+        const arr = JSON.parse(t.progress);
+        const last = arr[arr.length - 1];
+        prog = last ? `${esc(last.msg || '')}` : '—';
+      } catch {}
+    }
     return `<tr><td>#${t.id}</td>${showOwner ? `<td>${esc(t.username)}</td>` : ''}<td>${esc(t.exam_user)}</td>
     <td><span class="badge" style="background:${STATUS_COLOR[t.status]}">${STATUS_LABEL[t.status] || t.status}</span></td>
+    <td class="small">${KIND_LABEL[t.kind] || t.kind}</td>
     <td class="small">${esc(t.note) || '—'}</td><td class="small">${prog}</td>
     <td class="small">${esc(t.created_at.slice(5, 16))}</td>
     <td><a href="/task/${t.id}" class="btn gray" style="padding:4px 10px;width:auto">查看</a></td></tr>`;
   }).join('');
-  return `<div class="table-wrap"><table><tr><th>ID</th>${showOwner ? '<th>学号</th>' : ''}<th>账号</th><th>状态</th><th>备注</th><th>进度</th><th>时间</th><th></th></tr>${trs}</table></div>`;
+  return `<div class="table-wrap"><table><tr><th>ID</th>${showOwner ? '<th>学号</th>' : ''}<th>账号</th><th>状态</th><th>类型</th><th>备注</th><th>进度</th><th>时间</th><th></th></tr>${trs}</table></div>`;
 }
 
 function progressTable(t) {
   let arr = [];
   try { arr = JSON.parse(t.progress); } catch {}
   if (!arr.length) return '<p class="muted">尚未开始。</p>';
+  if (t.kind !== 'study') {
+    const rows = arr.slice(-40).map((p) => `<tr><td>${esc(p.msg || '')}</td></tr>`).join('');
+    return `<div class="table-wrap"><table><tr><th>进展</th></tr>${rows}</table></div>`;
+  }
   const map = new Map();
   for (const p of arr) map.set(p.course, p);
   const rows = [...map.values()].map((p) => {
@@ -303,8 +387,8 @@ app.post('/login', (req, res) => {
 app.get('/register', (req, res) => {
   if (getUserByToken(parseCookies(req).sid)) return res.redirect('/dashboard');
   res.send(layout('注册', `<div class="card"><h1>注册</h1>
-  <form method="post" action="/register"><label>学号(12610101 - 12613199)</label>
-  <input name="username" inputmode="numeric" placeholder="12610101" required>
+  <form method="post" action="/register"><label>学号(12610000 - 12613199)</label>
+  <input name="username" inputmode="numeric" placeholder="12610000" required>
   <label>密码(至少 6 位)</label><input type="password" name="password" minlength="6" required>
   <button>注册</button></form>
   <p class="muted">已有账号?<a href="/login">去登录</a></p></div>`, null));
@@ -313,7 +397,7 @@ app.post('/register', (req, res) => {
   const username = String(req.body.username || '').trim();
   const password = req.body.password || '';
   if (!isValidSid(username)) {
-    return res.send(layout('注册', `<div class="card"><div class="err">学号格式不正确(需为 12610101 - 12613199 范围内的 8 位数字)</div><a href="/register" class="btn gray">返回</a></div>`, null));
+    return res.send(layout('注册', `<div class="card"><div class="err">学号格式不正确(需为 12610000 - 12613199 范围内的 8 位数字)</div><a href="/register" class="btn gray">返回</a></div>`, null));
   }
   if (password.length < 6) {
     return res.send(layout('注册', `<div class="card"><div class="err">密码至少 6 位</div><a href="/register" class="btn gray">返回</a></div>`, null));
@@ -362,7 +446,14 @@ app.get('/task/new', requireAuth, (req, res) => {
   <form method="post" action="/task/new">
   <label>账号</label><input value="${esc(req.user.username)}" disabled>
   <label>密码</label><input type="password" name="exam_pass" required>
-  <label>并发数</label><input type="number" name="tabs" value="${DEFAULT_TABS}" min="1" max="36" required>
+  <label>任务类型</label>
+  <select name="kind">
+    <option value="study">刷课(学习时长)</option>
+    <option value="exam">自动答题(进考试→查题库→交卷→收录新题)</option>
+    <option value="bank">采集题库(从题库练习页抓题和答案)</option>
+  </select>
+  <label>考试关键字(仅自动答题,选填;留空自动选第一场可参加的考试)</label><input name="exam_filter" placeholder="如: 毛概 / 期末">
+  <label>并发数(仅刷课)</label><input type="number" name="tabs" value="${DEFAULT_TABS}" min="1" max="36" required>
   <label>备注(选填)</label><textarea name="note" rows="2"></textarea>
   <button>提交</button> <a href="/dashboard" class="btn gray">返回</a>
   </form></div>`;
@@ -371,10 +462,11 @@ app.get('/task/new', requireAuth, (req, res) => {
 app.post('/task/new', requireAuth, (req, res) => {
   const examPass = String(req.body.exam_pass || '');
   if (!examPass) return res.redirect('/task/new');
+  const kind = ['study', 'exam', 'bank'].includes(req.body.kind) ? req.body.kind : 'study';
   const tabs = Math.min(36, Math.max(1, parseInt(req.body.tabs, 10) || 1));
-  db.prepare(`INSERT INTO tasks (user_id, exam_user, exam_pass_enc, tabs, note, status, created_at, updated_at)
-    VALUES (?,?,?,?,?,?,?,?)`)
-    .run(req.user.id, req.user.username, encrypt(examPass), tabs, String(req.body.note || '').slice(0, 500), 'pending', now(), now());
+  db.prepare(`INSERT INTO tasks (user_id, exam_user, exam_pass_enc, kind, tabs, exam_filter, note, status, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(req.user.id, req.user.username, encrypt(examPass), kind, tabs, String(req.body.exam_filter || '').slice(0, 100), String(req.body.note || '').slice(0, 500), 'pending', now(), now());
   res.redirect('/dashboard');
 });
 
@@ -384,8 +476,8 @@ app.get('/task/:id', requireAuth, (req, res) => {
   if (t.user_id !== req.user.id && req.user.role !== 'admin') return res.status(403).send(layout('无权限', '<div class="card"><div class="err">无权限</div></div>', req.user));
   const canApprove = req.user.role === 'admin' && ['pending', 'rejected'].includes(t.status);
   const canCancel = ['pending', 'approved'].includes(t.status) && (t.user_id === req.user.id || req.user.role === 'admin');
-  const body = `<div class="card"><h1>任务 #${t.id} <span class="badge" style="background:${STATUS_COLOR[t.status]}">${STATUS_LABEL[t.status] || t.status}</span></h1>
-  <p class="muted">账号: ${esc(t.exam_user)} · 并发: ${t.tabs}${t.note ? ' · 备注: ' + esc(t.note) : ''}</p>
+  const body = `<div class="card"><h1>任务 #${t.id} <span class="badge" style="background:${STATUS_COLOR[t.status]}">${STATUS_LABEL[t.status] || t.status}</span> <span class="badge" style="background:#555">${KIND_LABEL[t.kind] || t.kind}</span></h1>
+  <p class="muted">账号: ${esc(t.exam_user)}${t.kind === 'study' ? ' · 并发: ' + t.tabs : ''}${t.exam_filter ? ' · 考试关键字: ' + esc(t.exam_filter) : ''}${t.note ? ' · 备注: ' + esc(t.note) : ''}</p>
   ${canApprove ? `<form method="post" action="/api/tasks/${t.id}/approve" style="display:inline"><button class="green">批准</button></form>
     <form method="post" action="/api/tasks/${t.id}/reject" style="display:inline"><button class="red">拒绝</button></form>` : ''}
   ${canCancel ? `<form method="post" action="/api/tasks/${t.id}/cancel" style="display:inline"><button class="gray">取消</button></form>` : ''}
@@ -416,8 +508,43 @@ app.get('/admin', requireAuth, requireAdmin, (req, res) => {
   <div class="grid">${statCards}</div>
   <p class="muted">筛选: ${['', 'pending', 'running', 'done', 'failed'].map((s) => (s ? `<a href="/admin?f=${s}">${STATUS_LABEL[s]}</a>` : '<a href="/admin">全部</a>')).join(' | ')}</p>
   ${tasksTable(rows, true)}
-  <p><a href="/admin/users" class="btn gray">用户</a></p></div>`;
+  <p><a href="/admin/users" class="btn gray">用户</a> <a href="/admin/bank" class="btn gray">题库(${bankCount()} 题)</a></p></div>`;
   res.send(layout('管理', body, req.user));
+});
+
+app.get('/admin/bank', requireAuth, requireAdmin, (req, res) => {
+  const srcs = db.prepare('SELECT source, COUNT(*) c FROM bank GROUP BY source').all();
+  const srcCards = srcs.map((s) => `<div class="stat"><b>${s.c}</b><span class="muted">${s.source}</span></div>`).join('');
+  const recent = db.prepare('SELECT question, answers, source, created_at FROM bank ORDER BY created_at DESC LIMIT 8').all();
+  const recentRows = recent.map((r) => {
+    let ans = '';
+    try { ans = JSON.parse(r.answers).join(' / '); } catch {}
+    return `<tr><td class="small">${esc(r.question)}</td><td class="small">${esc(ans)}</td><td class="small">${esc(r.source)}</td></tr>`;
+  }).join('');
+  const body = `<div class="card"><h1>题库管理</h1>
+  <div class="grid"><div class="stat"><b>${bankCount()}</b><span class="muted">总题数</span></div>${srcCards}</div>
+  <p><a href="/api/bank/export" class="btn green">导出题库 JSON</a></p>
+  <h2>导入题库</h2>
+  <p class="muted">支持粘贴 JSON(格式: {"题干": ["答案1","答案2"]}),重复题干自动跳过。油猴脚本导出的题库可直接导入。</p>
+  <form method="post" action="/api/bank/import"><textarea name="json" rows="6" style="font-family:monospace;font-size:12px"></textarea>
+  <button>导入</button></form>
+  <h2>最近收录</h2>
+  <div class="table-wrap"><table><tr><th>题干</th><th>答案</th><th>来源</th></tr>${recentRows || '<tr><td colspan="3" class="muted">暂无</td></tr>'}</table></div>
+  <p><a href="/admin" class="btn gray">返回</a></p></div>`;
+  res.send(layout('题库管理', body, req.user));
+});
+
+app.get('/api/bank/export', requireAuth, requireAdmin, (req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="bank-${new Date().toISOString().slice(0, 10)}.json"`);
+  res.send(exportBankJson());
+});
+
+app.post('/api/bank/import', requireAuth, requireAdmin, (req, res) => {
+  const r = importBankJson(req.body.json || '');
+  res.send(layout('导入题库', `<div class="card"><h1>导入结果</h1>
+  <div class="${r.ok ? 'ok' : 'err'}">${r.ok ? `成功导入 ${r.added} 题(共 ${r.total} 题,重复已跳过),题库现有 ${bankCount()} 题` : r.msg}</div>
+  <a href="/admin/bank" class="btn gray">返回题库管理</a></div>`, req.user));
 });
 
 app.get('/admin/users', requireAuth, requireAdmin, (req, res) => {

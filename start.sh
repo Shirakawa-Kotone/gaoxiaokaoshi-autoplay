@@ -2,7 +2,7 @@
 # 一键后台启动:网站(server.mjs) + Cloudflare 隧道(gaoxiao)
 # 用法: ./start.sh
 # 停止: ./stop.sh
-# 管理员学号默认 XXXXXXXX,可用环境变量覆盖:GX_ADMIN_IDS=12345678 ./start.sh
+# 管理员学号默认 12610000,可用环境变量覆盖:GX_ADMIN_IDS=12345678 ./start.sh
 cd "$(dirname "$0")"
 
 # 停掉可能残留的旧进程,避免端口/隧道冲突
@@ -10,7 +10,7 @@ pkill -f 'node server.mjs' 2>/dev/null && echo "已停止旧 server" || true
 pkill -f 'cloudflared tunnel run gaoxiao' 2>/dev/null && echo "已停止旧隧道" || true
 sleep 1
 
-export GX_ADMIN_IDS="${GX_ADMIN_IDS:-XXXXXXXX}"
+export GX_ADMIN_IDS="${GX_ADMIN_IDS:-12610000}"
 # 若默认 3000 端口被占用可改监听端口(示例 3002),需与隧道配置保持一致
 PORT=3002 nohup node server.mjs > server.log 2>&1 &
 echo $! > server.pid
