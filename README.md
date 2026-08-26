@@ -8,7 +8,7 @@
 cd gaoxiaokaoshi-autoplay
 npm install
 
-# 启动(GX_ADMIN_IDS 指定管理员学号,可多个,逗号分隔;本机 3000-3001 被容器占用,网站监听 3002)
+# 启动(GX_ADMIN_IDS 指定管理员学号,可多个,逗号分隔;若默认 3000 端口被占用,用 PORT=3002)
 PORT=3002 GX_ADMIN_IDS=XXXXXXXX npm run web
 # 打开 http://127.0.0.1:3002
 ```
@@ -25,10 +25,10 @@ PORT=3002 GX_ADMIN_IDS=XXXXXXXX npm run web
 
 ## 公网访问(Cloudflare Tunnel,固定域名)
 
-平台默认只监听本机;要用固定网址访问(默认 `https://gaoxiao.1awa1.ccwu.cc`),按下面两步:
+平台默认只监听本机;要用固定网址访问(示例 `https://gaoxiao.example.com`,换成你自己的域名),按下面两步:
 
 ```bash
-# 1. 一键配置(会打开浏览器登录 Cloudflare 授权,需能管理 gaoxiao.1awa1.ccwu.cc 域名)
+# 1. 一键配置(会打开浏览器登录 Cloudflare 授权,需能管理你的域名)
 ./setup-tunnel.sh
 
 # 2. 启动(两个终端):
@@ -36,8 +36,7 @@ PORT=3002 GX_ADMIN_IDS=XXXXXXXX npm run web
 #    终端2: cloudflared tunnel run gaoxiao
 ```
 
-然后访问 `https://gaoxiao.1awa1.ccwu.cc`。
-注意:`1awa1.ccwu.cc` 本身是原来的 Pages 服务,不要占用;想换别的子域,改 `setup-tunnel.sh`
+然后访问你的域名(示例 `https://gaoxiao.example.com`)。想换子域,改 `setup-tunnel.sh`
 顶部的 `HOSTNAME` 再跑一遍即可。
 域名绑定失败时,在 Cloudflare 面板手动加 CNAME:`<你的域名> → <隧道ID>.cfargotunnel.com`。
 
@@ -56,7 +55,7 @@ PORT=3002 HOST=0.0.0.0 GX_ADMIN_IDS=XXXXXXXX npm run web
 
 | 变量 | 说明 |
 |---|---|
-| `PORT` / `HOST` | 监听地址(默认 127.0.0.1:3000;本机 3000-3001 被容器占用,示例用 `PORT=3002`;`HOST=0.0.0.0` 开放局域网) |
+| `PORT` / `HOST` | 监听地址(默认 127.0.0.1:3000;若被占用改用 `PORT=3002`;`HOST=0.0.0.0` 开放局域网) |
 | `GX_ADMIN_IDS` | 管理员学号列表,逗号分隔(不设则首位注册者为管理员) |
 | `GX_SECRET` | 加密密钥(不设则自动生成 `secret.key`) |
 | `GX_MAX_PARALLEL` | 同时执行的任务数(默认 1) |

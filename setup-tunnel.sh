@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Cloudflare Tunnel 一键配置:把本机 3002 端口暴露到 https://gaoxiao.1awa1.ccwu.cc
-# 前置条件:一个能管理 gaoxiao.1awa1.ccwu.cc 的 Cloudflare 账号
+# Cloudflare Tunnel 一键配置:把本机网站端口暴露到你的域名(示例 https://gaoxiao.example.com)
+# 前置条件:一个能管理你域名的 Cloudflare 账号
 # 用法: ./setup-tunnel.sh    (中途会打开浏览器让你登录 Cloudflare 授权)
-# 注意:1awa1.ccwu.cc 本身是原来的 Pages 服务,不要占用;想换别的子域时改下面 HOSTNAME。
+# 注意:把下面 HOSTNAME 改成你自己的域名(可带子域),例如 gaoxiao.example.com。
 set -e
-HOSTNAME="gaoxiao.1awa1.ccwu.cc"
+HOSTNAME="gaoxiao.example.com"
 TUNNEL_NAME="gaoxiao"
-# 本机 3000-3001 被 snowluma 容器占用,网站监听 3002(与 start.sh 一致)
+# 网站监听端口;若默认 3000 被占用可改(示例 3002),需与 start.sh 保持一致
 LOCAL_URL="http://127.0.0.1:3002"
 cd "$(dirname "$0")"
 
