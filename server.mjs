@@ -278,11 +278,12 @@ const STATUS_COLOR = { pending: '#b8860b', approved: '#1e6fd9', rejected: '#a00'
 
 // ---------- ETA 预计结束时间 ----------
 // 每类任务的预估耗时(分钟),可用环境变量覆盖:
-//   GX_ETA_STUDY=60  GX_ETA_EXAM=30  GX_ETA_COMBINED=90
+//   GX_ETA_STUDY=60  GX_ETA_EXAM=15  GX_ETA_COMBINED=75
+// 实测:课后练习每讲约 12 秒,36 讲约 7-8 分钟;留重考(最多3轮)余量取 15
 const ETA_MIN = {
   study: parseInt(process.env.GX_ETA_STUDY || '60', 10) || 60,
-  exam: parseInt(process.env.GX_ETA_EXAM || '30', 10) || 30,
-  combined: parseInt(process.env.GX_ETA_COMBINED || '90', 10) || 90,
+  exam: parseInt(process.env.GX_ETA_EXAM || '15', 10) || 15,
+  combined: parseInt(process.env.GX_ETA_COMBINED || '75', 10) || 75,
 };
 const fmtHM = (d) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 
