@@ -1,0 +1,69 @@
+# 学时助手
+
+一个简单的网页平台:学生用学号注册,申请任务后由管理员批准,任务自动排队执行。
+
+## 启动
+
+```bash
+cd gaoxiaokaoshi-autoplay
+npm install
+
+# 启动(GX_ADMIN_IDS 指定管理员学号,可多个,逗号分隔;本机 3000-3001 被容器占用,网站监听 3002)
+PORT=3002 GX_ADMIN_IDS=XXXXXXXX npm run web
+# 打开 http://127.0.0.1:3002
+```
+
+## 使用
+
+1. **注册**:填学号(12610101 - 12613199 范围内)和自己设置的密码。
+   - `GX_ADMIN_IDS` 里列出的学号注册后直接是管理员;不设置该变量时,首位注册者成为管理员。
+   - 管理员也可以在「管理 → 用户」里直接把某个学号设为管理员。
+2. **申请任务**:账号固定为注册学号,只需填**密码**和**并发数**,备注可选。
+3. **管理员批准**:在「管理」页面点批准,任务进入队列自动执行;也可拒绝、取消。
+4. **查看进度**:任务详情页实时显示课程进度和日志(每 5 秒自动刷新)。
+5. **联系**:页面底部有联系 QQ(可用 `GX_QQ` 修改)。
+
+## 公网访问(Cloudflare Tunnel,固定域名)
+
+平台默认只监听本机;要用固定网址访问(默认 `https://gaoxiao.1awa1.ccwu.cc`),按下面两步:
+
+```bash
+# 1. 一键配置(会打开浏览器登录 Cloudflare 授权,需能管理 gaoxiao.1awa1.ccwu.cc 域名)
+./setup-tunnel.sh
+
+# 2. 启动(两个终端):
+#    终端1: PORT=3002 GX_ADMIN_IDS=XXXXXXXX node server.mjs
+#    终端2: cloudflared tunnel run gaoxiao
+```
+
+然后访问 `https://gaoxiao.1awa1.ccwu.cc`。
+注意:`1awa1.ccwu.cc` 本身是原来的 Pages 服务,不要占用;想换别的子域,改 `setup-tunnel.sh`
+顶部的 `HOSTNAME` 再跑一遍即可。
+域名绑定失败时,在 Cloudflare 面板手动加 CNAME:`<你的域名> → <隧道ID>.cfargotunnel.com`。
+
+## 局域网访问(HOST=0.0.0.0)
+
+想直接让同一 WiFi/局域网的同学访问(不经 Cloudflare),把服务监听所有网卡:
+
+```bash
+PORT=3002 HOST=0.0.0.0 GX_ADMIN_IDS=XXXXXXXX npm run web
+# 其他人访问 http://你电脑的局域网IP:3002
+```
+
+注意:`0.0.0.0` 意味着局域网内任何人都能访问(学号注册是唯一门槛);公网访问仍建议走隧道。
+
+## 环境变量
+
+| 变量 | 说明 |
+|---|---|
+| `PORT` / `HOST` | 监听地址(默认 127.0.0.1:3000;本机 3000-3001 被容器占用,示例用 `PORT=3002`;`HOST=0.0.0.0` 开放局域网) |
+| `GX_ADMIN_IDS` | 管理员学号列表,逗号分隔(不设则首位注册者为管理员) |
+| `GX_SECRET` | 加密密钥(不设则自动生成 `secret.key`) |
+| `GX_MAX_PARALLEL` | 同时执行的任务数(默认 1) |
+| `GX_DEFAULT_TABS` | 任务默认并发数(默认 4) |
+| `GX_QQ` | 页面底部联系 QQ(默认 3651693719) |
+
+## 其他
+
+- 数据保存在 `app.db`(SQLite);`secret.key` 是自动生成的加密密钥,请备份,丢失后无法解密已存密码。
+- 命令行单机模式(不用网页)仍可用:`GX_USER=学号 GX_PASS=密码 GX_TABS=8 node autoplay.mjs`
