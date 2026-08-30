@@ -121,6 +121,24 @@ function importBankJson(text) {
   return { ok: true, added: n, total: list.length };
 }
 
+// 初始题库:仓库自带 bank.json(108 题),首次启动(题库为空)时自动导入
+function seedBankIfEmpty() {
+  if (bankCount() > 0) return;
+  if (!fs.existsSync(BANK_FILE)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(BANK_FILE, 'utf8'));
+    const list = [];
+    for (const [q, a] of Object.entries(data || {})) {
+      const arr = Array.isArray(a) ? a.map((x) => String(x).trim()).filter(Boolean) : [String(a).trim()].filter(Boolean);
+      if (q && arr.length) list.push({ q: String(q).trim(), answers: arr });
+    }
+    const n = upsertBank(list, 'seed');
+    if (n > 0) console.log(`[BANK] 初始题库为空,已从 bank.json 导入 ${n} 题(共 ${bankCount()} 题)`);
+  } catch (e) {
+    console.log('[BANK] 初始题库导入失败:', e.message);
+  }
+}
+
 // ---------- 凭证加密(AES-256-GCM) ----------
 function loadSecret() {
   if (process.env.GX_SECRET) return crypto.createHash('sha256').update(process.env.GX_SECRET).digest();
@@ -665,6 +683,7 @@ app.post('/api/users/:id/demote', requireAuth, requireAdmin, (req, res) => {
 
 // ---------- 启动 ----------
 db.prepare("UPDATE tasks SET status='approved', updated_at=? WHERE status='running'").run(now());
+seedBankIfEmpty();
 
 const totalUsers = db.prepare('SELECT COUNT(*) c FROM users').get().c;
 console.log(`[DB] ${DB_FILE} 就绪, 用户 ${totalUsers} 个`);
