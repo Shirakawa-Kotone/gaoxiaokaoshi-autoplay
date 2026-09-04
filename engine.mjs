@@ -44,8 +44,19 @@ async function login(context, { examUser, examPass, log = () => {}, base = BASE 
       await loginPage.waitForTimeout(2000);
     }
     try {
-      await loginPage.goto(base + '/Default.aspx', { waitUntil: 'domcontentloaded' });
-      try { await loginPage.waitForURL(/Login\.aspx/, { timeout: 15000 }); } catch {}
+      // 平台 Default.aspx 会 JS 跳转到 Login.aspx,实测跳转需 8-10s,高峰可能更久
+      await loginPage.goto(base + '/Default.aspx', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      // 等登录表单真正出现(而不是在中间页干等);超时则重载 Default.aspx 重新触发跳转
+      let hasForm = false;
+      try {
+        await loginPage.waitForSelector('#name', { timeout: 20000 });
+        hasForm = true;
+      } catch {}
+      if (!hasForm) {
+        log('  ⚠ 登录页跳转慢,重载 Default.aspx...');
+        await loginPage.goto(base + '/Default.aspx', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await loginPage.waitForSelector('#name', { timeout: 30000 });
+      }
       await loginPage.waitForTimeout(1200);
       await loginPage.fill('#name', examUser);
       await loginPage.fill('#pw', examPass);
