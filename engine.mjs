@@ -184,6 +184,39 @@ export async function runStudyTask(opts = {}) {
     const loginPage = await login(context, { examUser, examPass, log, base });
     const tabPages = [loginPage];
     for (let i = 1; i < TOTAL_SLOTS; i++) tabPages.push(await context.newPage());
+    // 专职查询页:只发列表 fetch(不导航),避免被播放页重载打断;所有标签页共用(共享 cookie)
+    const fetchPage = await context.newPage();
+    await fetchPage.goto(base + '/Study/LibraryStudyList.aspx', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    // 专职重登页 + 互斥锁:同一时刻只允许一个标签页重新登录,其余等待,防止互相顶掉会话
+    const reloginPage = await context.newPage();
+    let reloginChain = Promise.resolve();
+    async function ensureLoggedIn(tag) {
+      const run = reloginChain.then(async () => {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            await reloginPage.goto(base + '/Default.aspx', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            try { await reloginPage.waitForSelector('#name', { timeout: 25000 }); } catch {}
+            await reloginPage.waitForTimeout(1000);
+            await reloginPage.fill('#name', examUser);
+            await reloginPage.fill('#pw', examPass);
+            await reloginPage
+              .evaluate(() => {
+                try { CkeckNotNull(); } catch (e) { document.getElementById('frmLogin').submit(); }
+              })
+              .catch(() => {});
+            await reloginPage.waitForTimeout(3000);
+            const clerk = (await context.cookies()).find((c) => c.name === 'Clerk');
+            if (clerk) { log(tag, '  ✓ 重新登录成功'); return true; }
+          } catch (e) {
+            log(tag, `  重新登录失败(第${attempt}次): ${String(e.message || e).split('\n')[0]}`);
+            await reloginPage.waitForTimeout(2000);
+          }
+        }
+        return false;
+      });
+      reloginChain = run.catch(() => {});
+      return run;
+    }
 
     // ---------- 列表操作(fetch 直发,不依赖页面导航) ----------
 
@@ -244,7 +277,7 @@ export async function runStudyTask(opts = {}) {
 
     async function scrapeCourses() {
       log('抓取课程列表...');
-      const pg = tabPages[0];
+      const pg = fetchPage;
       let html = await fetchHtml(pg, '/Study/LibraryStudyList.aspx');
       let state = await parseListHtml(pg, html);
       if (state.isLoginPage) throw new Error('会话失效:列表页返回登录页');
@@ -297,19 +330,14 @@ export async function runStudyTask(opts = {}) {
 
     async function currentDoneMinOnce(tag, course) {
       const courseId = course.id;
-      const pg = tabPages[0];
+      const pg = fetchPage; // 专职查询页,与播放页/重登页分离
       let html = await fetchHtml(pg, '/Study/LibraryStudyList.aspx');
       let state = await parseListHtml(pg, html);
       if (state.isLoginPage) {
         log(tag, '  ⚠ 会话失效,重新登录...');
-        await loginPage.goto(base + '/Default.aspx', { waitUntil: 'domcontentloaded' });
-        try { await loginPage.waitForURL(/Login\.aspx/, { timeout: 15000 }); } catch {}
-        await loginPage.fill('#name', examUser);
-        await loginPage.fill('#pw', examPass);
-        await Promise.all([
-          loginPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
-          loginPage.click('#btnSubmit'),
-        ]);
+        const ok = await ensureLoggedIn(tag);
+        if (!ok) return -1;
+        await pg.waitForTimeout(1500);
         html = await fetchHtml(pg, '/Study/LibraryStudyList.aspx');
         state = await parseListHtml(pg, html);
         if (state.isLoginPage) return -1;
