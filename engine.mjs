@@ -364,7 +364,23 @@ export async function runStudyTask(opts = {}) {
     }
 
     async function openAndPlay(tag, page, url) {
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      // 平台偶发 4xx/5xx/网络抖动:最多重试 3 次,每次间隔递增
+      let lastErr = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await page.goto(url, { waitUntil: 'domcontentloaded' });
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          const brief = String(e.message || e).split('\n')[0];
+          if (attempt < 3) {
+            log(tag, `  ⚠ 打开播放页失败(${brief}),${attempt}/3 重试...`);
+            await page.waitForTimeout(2000 * attempt);
+          }
+        }
+      }
+      if (lastErr) throw lastErr;
       await page
         .waitForFunction(() => typeof window.player !== 'undefined', { timeout: 30000 })
         .catch(() => log(tag, '  ⚠ 播放器未在 30s 内就绪,继续尝试'));
@@ -464,8 +480,14 @@ export async function runStudyTask(opts = {}) {
       }
       let doneCount = 0;
       for (const c of mine) {
-        const ok = await studyCourse(tag, page, c);
-        if (ok) doneCount++;
+        try {
+          const ok = await studyCourse(tag, page, c);
+          if (ok) doneCount++;
+        } catch (e) {
+          const brief = String(e.message || e).split('\n')[0];
+          log(tag, `✗ 课程失败: ${c.name} (${brief}),跳过继续下一门`);
+          onProgress({ course: c.name, doneMin: c.doneMin, reqMin: c.reqMin, phase: 'fail' });
+        }
         if (smoke) break;
       }
       log(tag, '=== 本标签页处理完毕 ===');
